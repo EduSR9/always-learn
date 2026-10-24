@@ -61,7 +61,7 @@ That's it: pick your deck in the window that opens and click
 prompt to an AI.
 
 > The Mac version is brand new. If something doesn't work,
-> [tell us here](https://github.com/EduSR9/always-learn/issues/new) (a free
+> [tell me here](https://github.com/EduSR9/always-learn/issues/new) (a free
 > GitHub account is needed).
 
 ## Using it
