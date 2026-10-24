@@ -1,4 +1,4 @@
-"""Windows-first utility for starting Anki review during AI usage."""
+"""Always Learn: Anki pops up while the AI is thinking (Windows, macOS beta)."""
 
 from __future__ import annotations
 
@@ -30,6 +30,8 @@ except ModuleNotFoundError as exc:
         "Always Learn needs its UI dependencies. From this repository folder, "
         "run: python -m pip install -r requirements.txt"
     ) from exc
+
+IS_MAC = sys.platform == "darwin"
 
 try:
     import comtypes
@@ -77,12 +79,21 @@ COLORS = {
     "green": "#4ADE80",
     "red": "#F87171",
 }
-FONT = ("Segoe UI", 10)
-FONT_BOLD = ("Segoe UI Semibold", 10)
-FONT_SMALL = ("Segoe UI", 9)
-FONT_SECTION = ("Segoe UI Semibold", 8)
-FONT_STATUS = ("Segoe UI Semibold", 11)
-FONT_TITLE = ("Segoe UI Semibold", 15)
+
+
+def ui_font(size: int, bold: bool = False) -> tuple:
+    if IS_MAC:  # Tk on macOS uses 72 dpi points, so sizes need a bump.
+        return ("Helvetica Neue", round(size * 1.3), "bold") if bold else ("Helvetica Neue", round(size * 1.3))
+    return ("Segoe UI Semibold", size) if bold else ("Segoe UI", size)
+
+
+FONT = ui_font(10)
+FONT_BOLD = ui_font(10, bold=True)
+FONT_SMALL = ui_font(9)
+FONT_SECTION = ui_font(8, bold=True)
+FONT_STATUS = ui_font(11, bold=True)
+FONT_TITLE = ui_font(15, bold=True)
+START_AT_LOGIN_LABEL = "Start at login" if IS_MAC else "Start with Windows"
 
 DEFAULT_AI_SITES = [
     "chatgpt.com",
@@ -97,16 +108,20 @@ DEFAULT_AI_SITES = [
     "chat.mistral.ai",
     "poe.com",
 ]
-DEFAULT_AI_APPS = ["claude.exe", "chatgpt.exe", "perplexity.exe"]
+# Windows executables and macOS app names (lowercase).
+DEFAULT_AI_APPS = ["claude.exe", "chatgpt.exe", "perplexity.exe", "claude", "chatgpt", "perplexity"]
 # Code editors with built-in AI chat (Claude Code, Copilot, Cursor...). Enter is
 # pressed constantly while coding, so here a prompt only counts once the AI's
 # Stop button actually appears.
 DEFAULT_IDE_APPS = [
     "code.exe", "code - insiders.exe", "cursor.exe", "windsurf.exe", "trae.exe", "kiro.exe",
+    "code", "visual studio code", "code - insiders", "cursor", "windsurf", "trae", "kiro",
 ]
 IDE_NAMES = {
     "code.exe": "VS Code", "code - insiders.exe": "VS Code Insiders", "cursor.exe": "Cursor",
     "windsurf.exe": "Windsurf", "trae.exe": "Trae", "kiro.exe": "Kiro",
+    "code": "VS Code", "visual studio code": "VS Code", "code - insiders": "VS Code Insiders",
+    "cursor": "Cursor", "windsurf": "Windsurf", "trae": "Trae", "kiro": "Kiro",
 }
 # Used only when a browser's address bar cannot be read.
 AI_TITLE_HINTS = [
@@ -380,6 +395,78 @@ def listen_for_show_requests(on_request: Callable[[], None]) -> None:
     threading.Thread(target=wait, daemon=True).start()
 
 
+def foreground_window() -> Optional[int]:
+    return user32.GetForegroundWindow()
+
+
+def window_exists(handle: int) -> bool:
+    return bool(user32.IsWindow(handle))
+
+
+def minimize_window(handle: int) -> None:
+    user32.ShowWindow(handle, SW_MINIMIZE)
+
+
+def missing_permissions() -> list[str]:
+    """Windows needs no special permissions."""
+    return []
+
+
+class InputHooks:
+    """Reports Enter presses and left clicks (never what is typed)."""
+
+    def __init__(
+        self, on_enter: Callable[[int], None], on_click: Callable[[int], None],
+        on_error: Callable[[str], None],
+    ) -> None:
+        self.on_enter, self.on_click, self.on_error = on_enter, on_click, on_error
+        self._thread_id = 0
+
+    def start(self) -> None:
+        threading.Thread(target=self._listen, daemon=True).start()
+
+    def stop(self) -> None:
+        if self._thread_id:
+            user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
+
+    def _listen(self) -> None:
+        self._thread_id = kernel32.GetCurrentThreadId()
+        enter_down = False
+
+        @HOOKPROC
+        def on_key(code: int, message: int, data: int) -> int:
+            nonlocal enter_down
+            if code == 0:
+                key = ctypes.cast(data, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                if key.vkCode == VK_RETURN and not key.flags & LLKHF_INJECTED:
+                    if message == WM_KEYDOWN and not enter_down:
+                        enter_down = True
+                        # Shift+Enter inserts a newline instead of sending.
+                        if not user32.GetAsyncKeyState(VK_SHIFT) & 0x8000:
+                            self.on_enter(user32.GetForegroundWindow())
+                    elif message == WM_KEYUP:
+                        enter_down = False
+            return user32.CallNextHookEx(None, code, message, data)
+
+        @HOOKPROC
+        def on_mouse(code: int, message: int, data: int) -> int:
+            if code == 0 and message == WM_LBUTTONDOWN:
+                self.on_click(user32.GetForegroundWindow())
+            return user32.CallNextHookEx(None, code, message, data)
+
+        module = kernel32.GetModuleHandleW(None)
+        keyboard_hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, on_key, module, 0)
+        mouse_hook = user32.SetWindowsHookExW(WH_MOUSE_LL, on_mouse, module, 0)
+        if not keyboard_hook:
+            self.on_error("Could not watch the Enter key; prompt detection is off.")
+        message = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+            pass
+        for hook in (keyboard_hook, mouse_hook):
+            if hook:
+                user32.UnhookWindowsHookEx(hook)
+
+
 # --------------------------------------------------------------------------
 # Windows integration: start with Windows, desktop shortcut
 # --------------------------------------------------------------------------
@@ -520,7 +607,7 @@ def start_anki_in_background(config: Config) -> None:
     while time.monotonic() < deadline:
         anki_window = find_anki_window()
         if anki_window:
-            user32.ShowWindow(anki_window, SW_MINIMIZE)
+            minimize_window(anki_window)
             return
         time.sleep(0.5)
 
@@ -759,6 +846,344 @@ class AIWindowDetector:
 
 
 # --------------------------------------------------------------------------
+# macOS backend (beta): the same functions as above, built on Apple's APIs.
+# A window "handle" on macOS is the app's process id.
+# --------------------------------------------------------------------------
+
+if IS_MAC:
+    import fcntl
+    import plistlib
+    import socket
+    from collections import deque
+
+    import AppKit
+    import ApplicationServices as AX
+    import Quartz
+
+    MAC_SHOW_PORT = 47613
+    LAUNCH_AGENT_LABEL = "com.edusr9.always-learn"
+    LAUNCH_AGENT = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+    KEYCODE_RETURN, KEYCODE_KEYPAD_ENTER, KEYCODE_S = 36, 76, 1
+    _CHROMIUM_URL = 'tell application "{}" to return URL of active tab of front window'
+    # Browser app name (lowercase) -> (label, AppleScript returning the front tab's URL).
+    MAC_BROWSERS = {
+        "google chrome": ("Chrome", _CHROMIUM_URL.format("Google Chrome")),
+        "arc": ("Arc", _CHROMIUM_URL.format("Arc")),
+        "microsoft edge": ("Edge", _CHROMIUM_URL.format("Microsoft Edge")),
+        "brave browser": ("Brave", _CHROMIUM_URL.format("Brave Browser")),
+        "vivaldi": ("Vivaldi", _CHROMIUM_URL.format("Vivaldi")),
+        "chromium": ("Chromium", _CHROMIUM_URL.format("Chromium")),
+        "opera": ("Opera", _CHROMIUM_URL.format("Opera")),
+        "safari": ("Safari", 'tell application "Safari" to return URL of front document'),
+        "firefox": ("Firefox", None),  # no AppleScript URL support: window title only
+        "zen": ("Zen", None),
+    }
+    _instance_lock = None
+
+    def _running_app(pid: int):
+        return AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+
+    def app_name(pid: int) -> str:
+        app = _running_app(pid) if pid else None
+        return str(app.localizedName() or "") if app else ""
+
+    def foreground_window() -> Optional[int]:
+        app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+        return int(app.processIdentifier()) if app else None
+
+    def window_pid(handle: int) -> int:
+        return handle
+
+    def window_exists(handle: int) -> bool:
+        app = _running_app(handle)
+        return app is not None and not app.isTerminated()
+
+    def find_anki_window() -> Optional[int]:
+        for app in AppKit.NSWorkspace.sharedWorkspace().runningApplications():
+            bundle = str(app.bundleIdentifier() or "").lower()
+            if str(app.localizedName() or "") == "Anki" or "ankiweb" in bundle:
+                return int(app.processIdentifier())
+        return None
+
+    def _ax_attribute(element, attribute):
+        error, value = AX.AXUIElementCopyAttributeValue(element, attribute, None)
+        return value if error == AX.kAXErrorSuccess else None
+
+    def bring_window_to_front(handle: int) -> None:
+        app = _running_app(handle)
+        if app is None:
+            return
+        app.unhide()
+        for window in _ax_attribute(AX.AXUIElementCreateApplication(handle), AX.kAXWindowsAttribute) or []:
+            AX.AXUIElementSetAttributeValue(window, AX.kAXMinimizedAttribute, False)
+        app.activateWithOptions_(
+            AppKit.NSApplicationActivateIgnoringOtherApps | AppKit.NSApplicationActivateAllWindows
+        )
+        deadline = time.monotonic() + 0.4
+        while foreground_window() != handle and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if foreground_window() != handle and app.bundleURL() is not None:
+            # Recent macOS versions may ignore activation requests from
+            # background apps; `open` on the app always brings it forward.
+            subprocess.run(["open", str(app.bundleURL().path())], check=False)
+            deadline = time.monotonic() + 1.5
+            while foreground_window() != handle and time.monotonic() < deadline:
+                time.sleep(0.05)
+
+    def minimize_window(handle: int) -> None:
+        app = _running_app(handle)
+        if app is not None:
+            app.hide()  # like Cmd+H: Anki keeps its card, ready for next time
+
+    def press_study_now(anki_window: int) -> None:
+        if foreground_window() != anki_window:
+            raise RuntimeError("macOS did not let Anki come to the front, so Study Now was not pressed.")
+        for key_down in (True, False):
+            event = Quartz.CGEventCreateKeyboardEvent(None, KEYCODE_S, key_down)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+
+    def acquire_single_instance() -> bool:
+        global _instance_lock
+        _instance_lock = open(Path.home() / ".always-learn.lock", "w")
+        try:
+            fcntl.flock(_instance_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+    def ask_running_instance_to_show() -> None:
+        try:
+            with socket.create_connection(("127.0.0.1", MAC_SHOW_PORT), timeout=1) as connection:
+                connection.sendall(b"show")
+        except OSError:
+            pass
+
+    def listen_for_show_requests(on_request: Callable[[], None]) -> None:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server.bind(("127.0.0.1", MAC_SHOW_PORT))
+        except OSError:
+            return
+        server.listen()
+
+        def accept() -> None:
+            while True:
+                connection, _ = server.accept()
+                connection.close()
+                on_request()
+
+        threading.Thread(target=accept, daemon=True).start()
+
+    def launch_target() -> tuple[str, list[str]]:
+        if FROZEN:
+            return sys.executable, []
+        return sys.executable, [str(Path(__file__).resolve())]
+
+    def starts_with_windows() -> bool:
+        return LAUNCH_AGENT.exists()
+
+    def set_start_with_windows(enabled: bool) -> None:
+        if not enabled:
+            LAUNCH_AGENT.unlink(missing_ok=True)
+            return
+        program, arguments = launch_target()
+        LAUNCH_AGENT.parent.mkdir(parents=True, exist_ok=True)
+        with open(LAUNCH_AGENT, "wb") as plist:
+            plistlib.dump({
+                "Label": LAUNCH_AGENT_LABEL,
+                "ProgramArguments": [program, *arguments, STARTUP_FLAG],
+                "RunAtLoad": True,
+                "ProcessType": "Interactive",
+            }, plist)
+
+    def create_desktop_shortcut() -> Optional[Path]:
+        return None  # on macOS the app lives in Applications and the Dock
+
+    def find_anki_executable(config: Config) -> Optional[Path]:
+        candidates = [Path(config.anki_path)] if config.anki_path else []
+        candidates += [Path("/Applications/Anki.app"), Path.home() / "Applications" / "Anki.app"]
+        return next((path for path in candidates if path.exists()), None)
+
+    def launch_anki(config: Config, background: bool = False) -> None:
+        app = find_anki_executable(config)
+        command = ["open", *(["-g", "-j"] if background else []), "-a", str(app) if app else "Anki"]
+        if subprocess.run(command, capture_output=True).returncode != 0:
+            raise RuntimeError(
+                "Could not find Anki. Install it in Applications, or set "
+                f'"anki_path" in {CONFIG_PATH}.'
+            )
+
+    def start_anki_in_background(config: Config) -> None:
+        if find_anki_window():
+            return
+        try:
+            launch_anki(config, background=True)
+        except RuntimeError as exc:
+            print(f"Always Learn: {exc}", file=sys.stderr)
+
+    def missing_permissions() -> list[str]:
+        """Ask macOS for the permissions Always Learn needs; return the ones still missing."""
+        missing = []
+        if not AX.AXIsProcessTrustedWithOptions({AX.kAXTrustedCheckOptionPrompt: True}):
+            missing.append("Accessibility")
+        preflight = getattr(Quartz, "CGPreflightListenEventAccess", None)
+        if preflight is not None and not preflight():
+            getattr(Quartz, "CGRequestListenEventAccess", lambda: None)()
+            missing.append("Input Monitoring")
+        return missing
+
+    class InputHooks:
+        """Reports Enter presses and left clicks (never what is typed)."""
+
+        def __init__(
+            self, on_enter: Callable[[int], None], on_click: Callable[[int], None],
+            on_error: Callable[[str], None],
+        ) -> None:
+            self.on_enter, self.on_click, self.on_error = on_enter, on_click, on_error
+            self._run_loop = None
+            self._tap = None
+
+        def start(self) -> None:
+            threading.Thread(target=self._listen, daemon=True).start()
+
+        def stop(self) -> None:
+            if self._run_loop is not None:
+                Quartz.CFRunLoopStop(self._run_loop)
+
+        def _on_event(self, proxy, event_type, event, refcon):
+            if event_type in (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput):
+                Quartz.CGEventTapEnable(self._tap, True)
+            elif event_type == Quartz.kCGEventKeyDown:
+                keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+                repeat = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventAutorepeat)
+                shift = Quartz.CGEventGetFlags(event) & Quartz.kCGEventFlagMaskShift
+                # Shift+Enter inserts a newline instead of sending.
+                if keycode in (KEYCODE_RETURN, KEYCODE_KEYPAD_ENTER) and not repeat and not shift:
+                    self.on_enter(foreground_window())
+            elif event_type == Quartz.kCGEventLeftMouseDown:
+                self.on_click(foreground_window())
+            return event
+
+        def _listen(self) -> None:
+            mask = Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown) | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDown)
+            self._tap = Quartz.CGEventTapCreate(
+                Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap,
+                Quartz.kCGEventTapOptionListenOnly, mask, self._on_event, None,
+            )
+            if not self._tap:
+                self.on_error(
+                    "Allow Always Learn in System Settings → Privacy & Security → "
+                    "Input Monitoring, then restart it."
+                )
+                return
+            source = Quartz.CFMachPortCreateRunLoopSource(None, self._tap, 0)
+            self._run_loop = Quartz.CFRunLoopGetCurrent()
+            Quartz.CFRunLoopAddSource(self._run_loop, source, Quartz.kCFRunLoopCommonModes)
+            Quartz.CGEventTapEnable(self._tap, True)
+            Quartz.CFRunLoopRun()
+
+    class AIWindowDetector:
+        """macOS: identifies AI chats by browser URL (AppleScript) or app name."""
+
+        MAX_NODES = 8000
+        SCAN_SECONDS = 0.6
+
+        def __init__(self) -> None:
+            self._urls: dict[int, tuple[str, float]] = {}
+            self._accessibility_enabled: set[int] = set()
+
+        def exe_name(self, pid: int) -> str:
+            return app_name(pid).lower()
+
+        def is_ide(self, pid: int, config: Config) -> bool:
+            return self.exe_name(pid) in config.ide_apps
+
+        def browser_url(self, pid: int, name: str) -> str:
+            script = MAC_BROWSERS[name][1]
+            if not script:
+                return ""
+            cached = self._urls.get(pid)
+            if cached and time.monotonic() - cached[1] < 1.5:
+                return cached[0]
+            try:
+                url = subprocess.run(
+                    ["osascript", "-e", script], capture_output=True, text=True, timeout=2
+                ).stdout.strip()
+            except (OSError, subprocess.TimeoutExpired):
+                url = ""
+            self._urls[pid] = (url, time.monotonic())
+            return url
+
+        def _window_title(self, pid: int) -> str:
+            window = _ax_attribute(AX.AXUIElementCreateApplication(pid), AX.kAXFocusedWindowAttribute)
+            title = _ax_attribute(window, AX.kAXTitleAttribute) if window is not None else None
+            return str(title or "")
+
+        def describe(self, pid: int, config: Config) -> tuple[str, Optional[str]]:
+            if not pid:
+                return "No window", None
+            name = self.exe_name(pid)
+            if name in config.ai_apps:
+                return f"{app_name(pid)} app", name
+            if name in config.ide_apps:
+                label = IDE_NAMES.get(name, app_name(pid))
+                return f"{label} (AI coding)", label
+            if name in MAC_BROWSERS:
+                browser = MAC_BROWSERS[name][0]
+                host = host_of(self.browser_url(pid, name))
+                if host:
+                    return f"{browser} · {host}", matches_site(host, config.ai_sites)
+                title = self._window_title(pid).lower()
+                return browser, next((hint for hint in AI_TITLE_HINTS if hint in title), None)
+            return app_name(pid) or "Unknown app", None
+
+        def _enable_accessibility(self, pid: int, app_element) -> None:
+            """Chromium shows web pages to the Accessibility API only when asked;
+            Electron apps (VS Code, Cursor, Claude) use AXManualAccessibility."""
+            if pid in self._accessibility_enabled:
+                return
+            self._accessibility_enabled.add(pid)
+            AX.AXUIElementSetAttributeValue(app_element, "AXManualAccessibility", True)
+            if self.exe_name(pid) in MAC_BROWSERS:
+                AX.AXUIElementSetAttributeValue(app_element, "AXEnhancedUserInterface", True)
+
+        def is_generating(self, pid: int) -> bool:
+            """True while the app's front window shows the AI's Stop button."""
+            app_element = AX.AXUIElementCreateApplication(pid)
+            self._enable_accessibility(pid, app_element)
+            windows = _ax_attribute(app_element, AX.kAXWindowsAttribute)
+            if not windows:
+                return False
+            # In browsers only look inside the page (the toolbar has its own
+            # "Stop loading" button).
+            in_browser = self.exe_name(pid) in MAC_BROWSERS
+            pending = deque([(windows[0], not in_browser)])
+            attributes = [AX.kAXRoleAttribute, AX.kAXTitleAttribute, AX.kAXDescriptionAttribute, AX.kAXChildrenAttribute]
+            deadline = time.monotonic() + self.SCAN_SECONDS
+            visited = 0
+            while pending and visited < self.MAX_NODES and time.monotonic() < deadline:
+                element, in_page = pending.popleft()
+                visited += 1
+                error, values = AX.AXUIElementCopyMultipleAttributeValues(element, attributes, 0, None)
+                if error != AX.kAXErrorSuccess or not values:
+                    continue
+                role, title, description, children = (list(values) + [None] * 4)[:4]
+                role = role if isinstance(role, str) else ""
+                in_page = in_page or role == "AXWebArea"
+                if in_page and role == "AXButton":
+                    for label in (title, description):
+                        if isinstance(label, str) and is_stop_button(label):
+                            return True
+                if children is not None and not isinstance(children, str):
+                    try:
+                        pending.extend((child, in_page) for child in children)
+                    except TypeError:
+                        pass
+            return False
+
+
+# --------------------------------------------------------------------------
 # Monitor
 # --------------------------------------------------------------------------
 
@@ -786,57 +1211,20 @@ class Monitor:
         self._launch_lock = threading.Lock()
         self._last_trigger = 0.0
         self._last_deck: Optional[str] = None
-        self._hook_thread_id = 0
         self._session: Optional[StudySession] = None
+        self._hooks = InputHooks(
+            self._enter_presses.put, self._clicks.put, lambda message: self.on_event("error", message)
+        )
 
     def start(self) -> None:
-        if sys.platform != "win32":
+        if sys.platform not in ("win32", "darwin"):
             return
-        threading.Thread(target=self._run_input_hooks, daemon=True).start()
+        self._hooks.start()
         threading.Thread(target=self._run, daemon=True).start()
 
     def stop(self) -> None:
         self.stop_event.set()
-        if self._hook_thread_id:
-            user32.PostThreadMessageW(self._hook_thread_id, WM_QUIT, 0, 0)
-
-    def _run_input_hooks(self) -> None:
-        """Watch Enter presses and left clicks; never what is typed."""
-        self._hook_thread_id = kernel32.GetCurrentThreadId()
-        enter_down = False
-
-        @HOOKPROC
-        def on_key(code: int, message: int, data: int) -> int:
-            nonlocal enter_down
-            if code == 0:
-                key = ctypes.cast(data, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                if key.vkCode == VK_RETURN and not key.flags & LLKHF_INJECTED:
-                    if message == WM_KEYDOWN and not enter_down:
-                        enter_down = True
-                        # Shift+Enter inserts a newline instead of sending.
-                        if not user32.GetAsyncKeyState(VK_SHIFT) & 0x8000:
-                            self._enter_presses.put(user32.GetForegroundWindow())
-                    elif message == WM_KEYUP:
-                        enter_down = False
-            return user32.CallNextHookEx(None, code, message, data)
-
-        @HOOKPROC
-        def on_mouse(code: int, message: int, data: int) -> int:
-            if code == 0 and message == WM_LBUTTONDOWN:
-                self._clicks.put(user32.GetForegroundWindow())
-            return user32.CallNextHookEx(None, code, message, data)
-
-        module = kernel32.GetModuleHandleW(None)
-        keyboard_hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, on_key, module, 0)
-        mouse_hook = user32.SetWindowsHookExW(WH_MOUSE_LL, on_mouse, module, 0)
-        if not keyboard_hook:
-            self.on_event("error", "Could not watch the Enter key; prompt detection is off.")
-        message = wintypes.MSG()
-        while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
-            pass
-        for hook in (keyboard_hook, mouse_hook):
-            if hook:
-                user32.UnhookWindowsHookEx(hook)
+        self._hooks.stop()
 
     def _run(self) -> None:
         detector = AIWindowDetector()
@@ -869,7 +1257,7 @@ class Monitor:
                 if detector.describe(clicked, self.config)[1]:
                     pending = arm(clicked)
 
-            foreground = user32.GetForegroundWindow()
+            foreground = foreground_window()
             if foreground and window_pid(foreground) != own_pid:
                 description, ai_name = detector.describe(foreground, self.config)
                 self.current_window = description
@@ -894,7 +1282,7 @@ class Monitor:
     def _update_session(self, detector: AIWindowDetector, now: float) -> None:
         session = self._session
         session.next_check = now + 0.4
-        if not user32.IsWindow(session.ai_window):
+        if not window_exists(session.ai_window):
             self._session = None
             return
         if detector.is_generating(session.ai_window):
@@ -915,9 +1303,9 @@ class Monitor:
 
     def _return_to_ai(self, ai_window: int) -> None:
         anki_window = find_anki_window()
-        if not anki_window or user32.GetForegroundWindow() != anki_window:
+        if not anki_window or foreground_window() != anki_window:
             return  # the user already moved on; don't yank windows around
-        user32.ShowWindow(anki_window, SW_MINIMIZE)
+        minimize_window(anki_window)
         bring_window_to_front(ai_window)
         self.on_event("info", f"{time.strftime('%H:%M')}  ·  AI finished, back to the chat")
 
@@ -1075,7 +1463,9 @@ class ScrollArea(tk.Frame):
         if isinstance(event.widget, (str, tk.Listbox)):
             return  # lists scroll themselves
         if self.scrollbar.winfo_ismapped():
-            self.canvas.yview_scroll(int(-event.delta / 120), "units")
+            # Windows reports wheel steps of 120; macOS trackpads report small deltas.
+            step = -event.delta if IS_MAC else int(-event.delta / 120)
+            self.canvas.yview_scroll(step, "units")
 
 
 def flat_button(
@@ -1102,7 +1492,8 @@ class SettingsWindow:
         self.monitor = monitor
         self.tray_icon: Optional[Icon] = None
         self.events: "queue.Queue[tuple[str, str]]" = queue.Queue()
-        self.scale = root.winfo_fpixels("1i") / 96
+        # macOS reports 72 dpi and scales Retina itself; Windows needs DPI scaling.
+        self.scale = 1.0 if IS_MAC else root.winfo_fpixels("1i") / 96
 
         root.title(APP_NAME)
         root.configure(bg=COLORS["background"])
@@ -1135,7 +1526,7 @@ class SettingsWindow:
         self.return_when_done.trace_add("write", lambda *_: self.persist())
         self.start_with_windows = tk.BooleanVar(value=starts_with_windows())
         ToggleRow(
-            page, "Start with Windows",
+            page, START_AT_LOGIN_LABEL,
             "Runs in the tray and opens Anki in the background when you log in.",
             self.start_with_windows, self.scale,
         ).pack(fill="x", pady=(self.px(8), 0))
@@ -1510,7 +1901,24 @@ def create_tray_icon(
     )
 
 
+def self_test() -> None:
+    """Check the platform layer without showing any UI (used by the CI build)."""
+    config = load_config()
+    detector = AIWindowDetector()
+    foreground = foreground_window()
+    print(f"platform: {sys.platform}, frozen: {FROZEN}")
+    print(f"foreground: {foreground!r} -> {detector.describe(foreground, config) if foreground else None}")
+    print(f"anki window: {find_anki_window()!r}, anki app: {find_anki_executable(config)}")
+    print(f"launch target: {launch_target()}")
+    print(f"starts at login: {starts_with_windows()}, icon exists: {ICON_PATH.exists()}")
+    print(f"stop-button rules ok: {is_stop_button('Stop response') and not is_stop_button('Stop (Shift+F5)')}")
+    print("self-test ok")
+
+
 def main() -> None:
+    if "--self-test" in sys.argv:
+        self_test()
+        return
     at_login = STARTUP_FLAG in sys.argv
     enable_dpi_awareness()
     if not acquire_single_instance():
@@ -1535,8 +1943,20 @@ def main() -> None:
     if at_login:
         root.withdraw()
         threading.Thread(target=start_anki_in_background, args=(config,), daemon=True).start()
+    missing = missing_permissions()
+    if missing:
+        root.deiconify()
+        settings.events.put((
+            "error",
+            f"macOS needs permission: System Settings → Privacy & Security → "
+            f"{' and '.join(missing)} → turn on Always Learn, then restart it.",
+        ))
     monitor.start()
-    threading.Thread(target=tray_icon.run, daemon=True).start()
+    if IS_MAC:
+        # macOS menu-bar icons must live on the main thread, next to Tk.
+        tray_icon.run_detached()
+    else:
+        threading.Thread(target=tray_icon.run, daemon=True).start()
     root.mainloop()
     monitor.stop()
     tray_icon.stop()

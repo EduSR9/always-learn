@@ -1,0 +1,89 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Set to "" once the Mac version has been tested on a real Mac.
+  MAC_LABEL: "-beta"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Self-test
+        run: |
+          python -m pip install -r requirements.txt
+          python always-learn.py --self-test
+      - name: Build exe
+        shell: cmd
+        run: build_exe.bat
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/always-learn.exe
+
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Self-test
+        run: |
+          python -m pip install -r requirements.txt
+          python always-learn.py --self-test
+      - name: Build app
+        run: bash build_mac.sh
+      - name: Self-test the built app
+        run: '"dist/Always Learn.app/Contents/MacOS/Always Learn" --self-test'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: dist/always-learn-mac*.dmg
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, mac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          {
+            echo "**Windows:** download \`always-learn.exe\` and double-click it."
+            echo
+            if [ -n "$MAC_LABEL" ]; then
+              echo "**macOS (beta, not fully tested yet):** download \`always-learn-mac$MAC_LABEL.dmg\`,"
+              echo "drag *Always Learn* to Applications, then right-click it → **Open** the first time."
+              echo "Allow it under System Settings → Privacy & Security → **Accessibility** and **Input Monitoring**."
+              echo "Found a problem? Please open an issue."
+            else
+              echo "**macOS:** download \`always-learn-mac.dmg\`, drag *Always Learn* to Applications,"
+              echo "then right-click it → **Open** the first time."
+            fi
+          } > notes.md
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" artifacts/* --repo "$GITHUB_REPOSITORY" \
+              --title "Always Learn $TAG" --notes-file notes.md
+          fi
