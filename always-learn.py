@@ -171,6 +171,9 @@ class Config:
     mode: str = "configured"
     configured_deck: str = ""
     random_decks: list[str] = field(default_factory=list)
+    # Named sets of decks for random mode, e.g. {"Chinese": ["Mandarin Phrases", ...]}.
+    deck_presets: dict[str, list[str]] = field(default_factory=dict)
+    active_preset: str = ""
     cooldown_seconds: int = 0
     ai_sites: list[str] = field(default_factory=lambda: DEFAULT_AI_SITES.copy())
     ai_apps: list[str] = field(default_factory=lambda: DEFAULT_AI_APPS.copy())
@@ -194,6 +197,9 @@ def load_config() -> Config:
     known = {item.name for item in fields(Config)}
     config = Config(**{key: value for key, value in data.items() if key in known})
     config.random_decks = [str(deck) for deck in config.random_decks]
+    if not isinstance(config.deck_presets, dict):
+        config.deck_presets = {}
+    config.deck_presets = {str(name): [str(deck) for deck in decks] for name, decks in config.deck_presets.items()}
     # Saved lists keep the user's own additions; newly added defaults are merged in.
     config.ai_sites = merge_defaults(config.ai_sites, DEFAULT_AI_SITES)
     config.ai_apps = merge_defaults(config.ai_apps, DEFAULT_AI_APPS)
@@ -1969,20 +1975,68 @@ class SettingsWindow:
         self.deck_combo.pack(side="left", fill="x", expand=True)
         self.configured_deck.trace_add("write", lambda *_: self.persist())
 
-        # A checklist: clicking a row ticks or unticks that deck.
         self.random_picker = tk.Frame(self.deck_area, bg=COLORS["background"])
         self.deck_names: list[str] = []
         self.ticked_decks = set(self.config.random_decks)
+
+        # Presets: save the ticked decks under a name, pick it again later.
+        preset_row = tk.Frame(self.random_picker, bg=COLORS["background"])
+        preset_row.pack(fill="x", pady=(0, self.px(8)))
+        self.preset_name = tk.StringVar(value=self.config.active_preset)
+        self.preset_combo = ttk.Combobox(
+            preset_row, textvariable=self.preset_name, style="Dark.TCombobox", font=FONT,
+            values=sorted(self.config.deck_presets),
+        )
+        self.preset_combo.pack(side="left", fill="x", expand=True)
+        self.preset_combo.bind("<<ComboboxSelected>>", lambda _: self._apply_preset(self.preset_name.get()))
+        self.preset_combo.bind("<Return>", lambda _: self._save_preset())
+        self.preset_name.trace_add("write", lambda *_: self._update_deck_hint())
+        delete = tk.Label(
+            preset_row, text="✕", font=FONT_BOLD, cursor="hand2",
+            fg=COLORS["muted"], bg=COLORS["background"], padx=self.px(6),
+        )
+        delete.pack(side="right")
+        delete.bind("<Button-1>", lambda _: self._delete_preset())
+        RoundedButton(preset_row, "Save preset", self._save_preset, self.scale, variant="secondary").pack(
+            side="right", padx=(self.px(6), 0)
+        )
+
+        # A checklist: click a deck to tick it, or press and drag over several.
+        list_frame = tk.Frame(self.random_picker, bg=COLORS["background"])
+        list_frame.pack(fill="x")
         self.random_list = tk.Listbox(
-            self.random_picker, selectmode="single", exportselection=False,
+            list_frame, selectmode="single", exportselection=False,
             height=4, font=FONT, activestyle="none", relief="flat", bd=0,
             bg=COLORS["surface_high"], fg=COLORS["text"],
             selectbackground=COLORS["surface_high"], selectforeground=COLORS["text"],
             highlightthickness=1, highlightbackground=COLORS["border"],
             highlightcolor=COLORS["border"], cursor="hand2",
         )
+        list_scrollbar = ttk.Scrollbar(
+            list_frame, orient="vertical", command=self.random_list.yview, style="Dark.Vertical.TScrollbar"
+        )
+        self.random_list.configure(yscrollcommand=list_scrollbar.set)
+        list_scrollbar.pack(side="right", fill="y")
         self.random_list.pack(side="left", fill="x", expand=True)
-        self.random_list.bind("<<ListboxSelect>>", lambda _: self._toggle_selected_deck())
+        self._drag_value: Optional[bool] = None
+        self._drag_last = 0
+        self.random_list.bind("<ButtonPress-1>", self._drag_start)
+        self.random_list.bind("<B1-Motion>", self._drag_move)
+        self.random_list.bind("<ButtonRelease-1>", self._drag_end)
+
+        quick_row = tk.Frame(self.random_picker, bg=COLORS["background"])
+        quick_row.pack(fill="x", pady=(self.px(4), 0))
+        for text, ticked in (("Tick all", True), ("Untick all", False)):
+            link = tk.Label(
+                quick_row, text=text, font=FONT_SMALL, cursor="hand2",
+                fg=COLORS["blue"], bg=COLORS["background"],
+            )
+            link.pack(side="left", padx=(0, self.px(12)))
+            link.bind("<Button-1>", lambda _, ticked=ticked: self._set_all_decks(ticked))
+        tk.Label(
+            quick_row, text="Tip: press and drag to tick several", font=FONT_SMALL,
+            fg=COLORS["muted"], bg=COLORS["background"],
+        ).pack(side="right")
 
         hint_row = tk.Frame(self.deck_area, bg=COLORS["background"])
         hint_row.pack(side="bottom", fill="x", pady=(self.px(5), 0))
@@ -2038,7 +2092,7 @@ class SettingsWindow:
         for index in range(len(decks)):
             self.random_list.insert("end", "")
             self._render_deck_row(index)
-        self.random_list.configure(height=min(max(len(decks), 2), 6))
+        self.random_list.configure(height=min(max(len(decks), 2), 8))
         self._update_deck_hint()
 
     def _render_deck_row(self, index: int) -> None:
@@ -2049,16 +2103,86 @@ class SettingsWindow:
         color = COLORS["text"] if ticked else COLORS["muted"]
         self.random_list.itemconfigure(index, fg=color, selectforeground=color)
 
-    def _toggle_selected_deck(self) -> None:
-        selection = self.random_list.curselection()
-        if not selection:
-            return
-        index = selection[0]
-        self.ticked_decks ^= {self.deck_names[index]}
-        self._render_deck_row(index)
-        self.random_list.selection_clear(0, "end")
+    def _set_deck(self, index: int, ticked: bool) -> None:
+        deck = self.deck_names[index]
+        if (deck in self.ticked_decks) != ticked:
+            self.ticked_decks ^= {deck}
+            self._render_deck_row(index)
+
+    def _drag_start(self, event: tk.Event) -> str:
+        """Clicking a deck flips it; dragging applies the same state to every deck passed."""
+        if self.deck_names:
+            index = self.random_list.nearest(event.y)
+            self._drag_value = self.deck_names[index] not in self.ticked_decks
+            self._drag_last = index
+            self._set_deck(index, self._drag_value)
+            self._update_deck_hint()
+        return "break"  # no default list selection highlight
+
+    def _drag_move(self, event: tk.Event) -> str:
+        if self._drag_value is None:
+            return "break"
+        if event.y < 0:  # dragging past the edge scrolls the list
+            self.random_list.yview_scroll(-1, "units")
+        elif event.y > self.random_list.winfo_height():
+            self.random_list.yview_scroll(1, "units")
+        index = self.random_list.nearest(event.y)
+        # Fill every row between the last one and this one (fast drags skip rows).
+        for row in range(min(index, self._drag_last), max(index, self._drag_last) + 1):
+            self._set_deck(row, self._drag_value)
+        self._drag_last = index
+        self._update_deck_hint()
+        return "break"
+
+    def _drag_end(self, _: tk.Event) -> str:
+        if self._drag_value is not None:
+            self._drag_value = None
+            self.persist()
+        return "break"
+
+    def _set_all_decks(self, ticked: bool) -> None:
+        for index in range(len(self.deck_names)):
+            self._set_deck(index, ticked)
         self.persist()
         self._update_deck_hint()
+
+    def _apply_preset(self, name: str) -> None:
+        decks = self.config.deck_presets.get(name)
+        if decks is None:
+            return
+        self.ticked_decks = set(decks) & set(self.deck_names) if self.deck_names else set(decks)
+        for index in range(len(self.deck_names)):
+            self._render_deck_row(index)
+        self.config.active_preset = name
+        self.persist()
+        self._update_deck_hint()
+
+    def _save_preset(self) -> None:
+        name = self.preset_name.get().strip()
+        if not name:
+            self.deck_hint.configure(text="Type a name for the preset first (e.g. Chinese).", fg=COLORS["yellow"])
+            self.preset_combo.focus_set()
+            return
+        if not self.ticked_decks:
+            self.deck_hint.configure(text="Tick the decks for this preset first.", fg=COLORS["yellow"])
+            return
+        decks = [deck for deck in self.deck_names if deck in self.ticked_decks] or sorted(self.ticked_decks)
+        self.config.deck_presets[name] = decks
+        self.config.active_preset = name
+        self.preset_combo.configure(values=sorted(self.config.deck_presets))
+        self.persist()
+        self.deck_hint.configure(text=f"Saved preset \u201c{name}\u201d ({len(decks)} decks).", fg=COLORS["green"])
+
+    def _delete_preset(self) -> None:
+        name = self.preset_name.get().strip()
+        if name not in self.config.deck_presets:
+            return
+        del self.config.deck_presets[name]
+        self.config.active_preset = ""
+        self.preset_combo.configure(values=sorted(self.config.deck_presets))
+        self.preset_name.set("")
+        self.persist()
+        self.deck_hint.configure(text=f"Deleted preset \u201c{name}\u201d.", fg=COLORS["muted"])
 
     def _update_deck_hint(self) -> None:
         if not getattr(self, "anki_reachable", True):
@@ -2067,11 +2191,19 @@ class SettingsWindow:
             self.deck_hint.configure(text=f"{len(self.deck_names)} decks in Anki", fg=COLORS["muted"])
         elif len(self.ticked_decks) < 2:
             self.deck_hint.configure(text="Tick at least 2 decks to rotate between them.", fg=COLORS["yellow"])
+        elif self._preset_changed():
+            name = self.preset_name.get().strip()
+            self.deck_hint.configure(text=f"Changed: click Save preset to update \u201c{name}\u201d.", fg=COLORS["yellow"])
         else:
             self.deck_hint.configure(
                 text=f"Random from {len(self.ticked_decks)} of {len(self.deck_names)} decks, never the same twice in a row",
                 fg=COLORS["muted"],
             )
+
+    def _preset_changed(self) -> bool:
+        name = self.preset_name.get().strip() if hasattr(self, "preset_name") else ""
+        saved = self.config.deck_presets.get(name)
+        return saved is not None and set(saved) & set(self.deck_names) != self.ticked_decks
 
     def persist(self) -> None:
         if not hasattr(self, "sound_on_open"):
