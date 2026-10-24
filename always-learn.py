@@ -17,11 +17,12 @@ import urllib.request
 from ctypes import wintypes
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+from tkinter import font as tkfont
 from tkinter import ttk
 from typing import Callable, Optional
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageDraw, ImageFilter, ImageTk
     from pystray import Icon, Menu, MenuItem
 except ModuleNotFoundError as exc:
     if exc.name not in {"PIL", "pystray"}:
@@ -50,6 +51,7 @@ APP_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).resolve().pa
 ASSETS_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR)) / "assets"
 ICON_PATH = ASSETS_DIR / "icon.png"
 ICO_PATH = ASSETS_DIR / "icon.ico"
+SOUND_PATH = ASSETS_DIR / "open.wav"
 CONFIG_PATH = Path.home() / ".always-learn.json"
 STARTUP_FLAG = "--startup"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -155,6 +157,8 @@ class Config:
     enabled: bool = True
     # Minimize Anki and go back to the chat once the AI finishes answering.
     return_when_done: bool = True
+    # Play a short chime when Anki pops up.
+    sound_on_open: bool = True
     mode: str = "configured"
     configured_deck: str = ""
     random_decks: list[str] = field(default_factory=list)
@@ -620,6 +624,21 @@ def press_study_now(anki_window: int) -> None:
     user32.keybd_event(VK_S, 0, KEYEVENTF_KEYUP, 0)
 
 
+def play_open_sound() -> None:
+    """A short chime as the card pops up (non-blocking)."""
+    if not SOUND_PATH.exists():
+        return
+    try:
+        if IS_MAC:
+            subprocess.Popen(["afplay", str(SOUND_PATH)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif sys.platform == "win32":
+            import winsound
+
+            winsound.PlaySound(str(SOUND_PATH), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+    except (OSError, RuntimeError) as exc:
+        print(f"Always Learn: could not play the sound: {exc}", file=sys.stderr)
+
+
 def open_anki_deck(deck_name: str, config: Config) -> None:
     """Open Anki (launching it if needed), focus it and show a card from deck_name."""
     try:
@@ -647,6 +666,8 @@ def open_anki_deck(deck_name: str, config: Config) -> None:
     reviewing = current_review_deck()
     if reviewing == deck_name or (reviewing or "").startswith(deck_name + "::"):
         bring_window_to_front(anki_window)  # keep the card that is already up
+        if config.sound_on_open:
+            play_open_sound()
         return
     if reviewing:
         anki_connect("guiDeckBrowser")
@@ -667,6 +688,8 @@ def open_anki_deck(deck_name: str, config: Config) -> None:
         raise RuntimeError(f"Anki could not open {deck_name}.")
 
     bring_window_to_front(anki_window)
+    if config.sound_on_open:
+        play_open_sound()
     time.sleep(0.5)  # let the overview page finish rendering
     for _ in range(2):
         press_study_now(anki_window)
@@ -1364,7 +1387,7 @@ class ToggleRow(tk.Frame):
             highlightbackground=COLORS["border"], padx=12, pady=9, cursor="hand2",
         )
         self.variable = variable
-        self.width, self.height = int(36 * scale), int(20 * scale)
+        self.width, self.height = round(42 * scale), round(24 * scale)
         self.switch = tk.Canvas(
             self, width=self.width, height=self.height, bg=COLORS["surface"],
             highlightthickness=0, cursor="hand2",
@@ -1389,45 +1412,195 @@ class ToggleRow(tk.Frame):
         self.draw()
 
     def draw(self) -> None:
-        on = self.variable.get()
-        width, height = self.width, self.height
-        color = COLORS["blue"] if on else COLORS["border"]
-        self.switch.delete("all")
-        self.switch.create_oval(0, 0, height, height, fill=color, outline=color)
-        self.switch.create_oval(width - height, 0, width, height, fill=color, outline=color)
-        self.switch.create_rectangle(height / 2, 0, width - height / 2, height, fill=color, outline=color)
-        knob = 3
-        left = width - height + knob if on else knob
-        self.switch.create_oval(
-            left, knob, left + height - 2 * knob, height - knob,
-            fill=COLORS["text"], outline=COLORS["text"],
+        if not hasattr(self, "_images"):
+            self._images = {on: ImageTk.PhotoImage(switch_image(on, self.width, self.height)) for on in (True, False)}
+            self.switch.delete("all")
+            self._switch_item = self.switch.create_image(0, 0, anchor="nw")
+        self.switch.itemconfigure(self._switch_item, image=self._images[bool(self.variable.get())])
+
+
+def hex_rgb(color: str) -> tuple[int, int, int]:
+    return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def rounded_image(
+    width: int, height: int, radius: int, top: str, bottom: Optional[str] = None,
+    border: Optional[str] = None, shadow: int = 0,
+) -> Image.Image:
+    """An anti-aliased rounded rectangle with a vertical gradient, optional border
+    and soft drop shadow (drawn 4x larger, then scaled down for smooth edges)."""
+    ss = 4
+    full_w, full_h = (width + 2 * shadow) * ss, (height + 2 * shadow) * ss
+    image = Image.new("RGBA", (full_w, full_h), (0, 0, 0, 0))
+    box = (shadow * ss, shadow * ss, (shadow + width) * ss - 1, (shadow + height) * ss - 1)
+    if shadow:
+        shade = Image.new("RGBA", (full_w, full_h), (0, 0, 0, 0))
+        drop = shadow * ss // 2
+        ImageDraw.Draw(shade).rounded_rectangle(
+            (box[0], box[1] + drop, box[2], box[3] + drop), radius * ss, fill=(0, 0, 0, 120)
         )
+        image = shade.filter(ImageFilter.GaussianBlur(shadow * ss / 2))
+    top_rgb, bottom_rgb = hex_rgb(top), hex_rgb(bottom or top)
+    gradient = Image.new("RGBA", (1, height * ss))
+    for y in range(height * ss):
+        mix = y / max(1, height * ss - 1)
+        gradient.putpixel((0, y), tuple(round(a + (b - a) * mix) for a, b in zip(top_rgb, bottom_rgb)) + (255,))
+    gradient = gradient.resize((width * ss, height * ss))
+    mask = Image.new("L", (width * ss, height * ss), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, width * ss - 1, height * ss - 1), radius * ss, fill=255)
+    image.paste(gradient, (shadow * ss, shadow * ss), mask)
+    if border:
+        ImageDraw.Draw(image).rounded_rectangle(box, radius * ss, outline=hex_rgb(border) + (255,), width=ss)
+    return image.resize((width + 2 * shadow, height + 2 * shadow), Image.LANCZOS)
 
 
-class SegmentedControl(tk.Frame):
-    """Side-by-side buttons where exactly one is selected."""
+def switch_image(on: bool, width: int, height: int) -> Image.Image:
+    if on:
+        track = rounded_image(width, height, height // 2, "#62B4FF", "#3B8CF0")
+    else:
+        track = rounded_image(width, height, height // 2, "#2A3342", "#222936", border="#3A4760")
+    inset = max(2, height // 7)
+    size = height - 2 * inset
+    knob = rounded_image(size, size, size // 2, "#FFFFFF", "#DDE3EC")
+    track.alpha_composite(knob, (width - size - inset if on else inset, inset))
+    return track
 
-    def __init__(self, parent: tk.Widget, options: list[tuple[str, str]], variable: tk.StringVar) -> None:
-        super().__init__(parent, bg=COLORS["surface"], highlightthickness=1,
-                         highlightbackground=COLORS["border"], padx=3, pady=3)
+
+class RoundedButton(tk.Canvas):
+    """A pill-shaped button with gradient, soft shadow, and hover/press states."""
+
+    STYLES = {
+        "primary": {
+            "normal": ("#6CBBFF", "#3B8CF0", None), "hover": ("#8CCBFF", "#509CF6", None),
+            "pressed": ("#3B8CF0", "#2E74D0", None), "text": COLORS["on_blue"],
+        },
+        "secondary": {
+            "normal": ("#2C3546", "#212836", "#3A4760"), "hover": ("#36425A", "#29323F", "#4C5D7D"),
+            "pressed": ("#1F2633", "#1A202B", "#3A4760"), "text": COLORS["text"],
+        },
+    }
+
+    def __init__(
+        self, parent: tk.Widget, text: str, command: Callable[[], None], scale: float,
+        variant: str = "primary", min_text: str = "",
+    ) -> None:
+        style = self.STYLES[variant]
+        font = tkfont.Font(root=parent, font=FONT_BOLD)
+        shadow = max(2, round((4 if variant == "primary" else 2) * scale))
+        height = round(36 * scale)
+        width = max(font.measure(text), font.measure(min_text)) + round(40 * scale)
+        super().__init__(
+            parent, width=width + 2 * shadow, height=height + 2 * shadow,
+            bg=parent.cget("bg"), highlightthickness=0, bd=0, cursor="hand2",
+        )
+        self.command = command
+        self._images = {
+            state: ImageTk.PhotoImage(rounded_image(width, height, height // 2, *style[state][:2],
+                                                    border=style[state][2], shadow=shadow))
+            for state in ("normal", "hover", "pressed")
+        }
+        self._background = self.create_image(0, 0, anchor="nw", image=self._images["normal"])
+        self._text = self.create_text(
+            width / 2 + shadow, height / 2 + shadow, text=text, font=FONT_BOLD, fill=style["text"]
+        )
+        self._inside = False
+        self.bind("<Enter>", lambda _: self._set_inside(True))
+        self.bind("<Leave>", lambda _: self._set_inside(False))
+        self.bind("<ButtonPress-1>", lambda _: self._show("pressed"))
+        self.bind("<ButtonRelease-1>", self._release)
+
+    def _show(self, state: str) -> None:
+        self.itemconfigure(self._background, image=self._images[state])
+
+    def _set_inside(self, inside: bool) -> None:
+        self._inside = inside
+        self._show("hover" if inside else "normal")
+
+    def _release(self, _: tk.Event) -> None:
+        self._show("hover" if self._inside else "normal")
+        if self._inside:
+            self.command()
+
+    def set_text(self, text: str) -> None:
+        self.itemconfigure(self._text, text=text)
+
+
+class SegmentedControl(tk.Canvas):
+    """A pill-shaped choice between options; the highlight slides to the selection."""
+
+    def __init__(
+        self, parent: tk.Widget, options: list[tuple[str, str]], variable: tk.StringVar, scale: float,
+    ) -> None:
+        self.bar_height = round(40 * scale)
+        super().__init__(
+            parent, height=self.bar_height, bg=parent.cget("bg"),
+            highlightthickness=0, bd=0, cursor="hand2",
+        )
+        self.options = options
         self.variable = variable
-        self.buttons: dict[str, tk.Label] = {}
-        for column, (value, text) in enumerate(options):
-            button = tk.Label(self, text=text, font=FONT_BOLD, padx=14, pady=5, cursor="hand2")
-            button.grid(row=0, column=column, sticky="nsew")
-            button.bind("<Button-1>", lambda _, value=value: variable.set(value))
-            self.columnconfigure(column, weight=1, uniform="segments")
-            self.buttons[value] = button
-        variable.trace_add("write", lambda *_: self.refresh())
-        self.refresh()
+        self.inset = max(3, round(4 * scale))
+        self._images: dict[str, ImageTk.PhotoImage] = {}
+        self._size = (0, 0)
+        self._pill_x: Optional[float] = None
+        self._animation: Optional[str] = None
+        self.bind("<Configure>", lambda _: self._rebuild())
+        self.bind("<Button-1>", self._click)
+        variable.trace_add("write", lambda *_: self._slide())
 
-    def refresh(self) -> None:
-        for value, button in self.buttons.items():
-            selected = self.variable.get() == value
-            button.configure(
-                bg=COLORS["blue"] if selected else COLORS["surface"],
-                fg=COLORS["on_blue"] if selected else COLORS["muted"],
+    def _selected_index(self) -> int:
+        values = [value for value, _ in self.options]
+        return values.index(self.variable.get()) if self.variable.get() in values else 0
+
+    def _segment_width(self) -> float:
+        return (self.winfo_width() - 2 * self.inset) / len(self.options)
+
+    def _click(self, event: tk.Event) -> None:
+        index = int((event.x - self.inset) // max(1, self._segment_width()))
+        index = min(max(index, 0), len(self.options) - 1)
+        self.variable.set(self.options[index][0])
+
+    def _rebuild(self) -> None:
+        width, height = self.winfo_width(), self.bar_height
+        if width < 20 or (width, height) == self._size:
+            return
+        self._size = (width, height)
+        pill_w, pill_h = round(self._segment_width()), height - 2 * self.inset
+        self._images = {
+            "track": ImageTk.PhotoImage(rounded_image(width, height, height // 2, "#1A202B", "#151A23", border=COLORS["border"])),
+            "pill": ImageTk.PhotoImage(rounded_image(pill_w, pill_h, pill_h // 2, "#6CBBFF", "#3B8CF0")),
+        }
+        self._pill_x = self.inset + self._selected_index() * self._segment_width()
+        self._draw()
+
+    def _draw(self) -> None:
+        if not self._images:
+            return
+        self.delete("all")
+        self.create_image(0, 0, anchor="nw", image=self._images["track"])
+        self.create_image(self._pill_x, self.inset, anchor="nw", image=self._images["pill"])
+        segment = self._segment_width()
+        selected = self._selected_index()
+        for index, (_, text) in enumerate(self.options):
+            self.create_text(
+                self.inset + segment * (index + 0.5), self.bar_height / 2, text=text, font=FONT_BOLD,
+                fill=COLORS["on_blue"] if index == selected else COLORS["muted"],
             )
+
+    def _slide(self) -> None:
+        if self._pill_x is None:
+            return
+        target = self.inset + self._selected_index() * self._segment_width()
+        if self._animation:
+            self.after_cancel(self._animation)
+        start = self._pill_x
+
+        def step(frame: int = 1, frames: int = 8) -> None:
+            progress = 1 - (1 - frame / frames) ** 3  # ease out
+            self._pill_x = start + (target - start) * progress
+            self._draw()
+            self._animation = self.after(15, step, frame + 1) if frame < frames else None
+
+        step()
 
 
 class ScrollArea(tk.Frame):
@@ -1468,21 +1641,6 @@ class ScrollArea(tk.Frame):
             self.canvas.yview_scroll(step, "units")
 
 
-def flat_button(
-    parent: tk.Widget, text: str, command: Callable[[], None], primary: bool = False
-) -> tk.Label:
-    background = COLORS["blue"] if primary else COLORS["surface_high"]
-    hover = COLORS["blue_hover"] if primary else COLORS["border"]
-    button = tk.Label(
-        parent, text=text, font=FONT_BOLD, padx=16, pady=7, cursor="hand2",
-        bg=background, fg=COLORS["on_blue"] if primary else COLORS["text"],
-    )
-    button.bind("<Button-1>", lambda _: command())
-    button.bind("<Enter>", lambda _: button.configure(bg=hover))
-    button.bind("<Leave>", lambda _: button.configure(bg=background))
-    return button
-
-
 class SettingsWindow:
     WIDTH = 440
 
@@ -1512,7 +1670,7 @@ class SettingsWindow:
 
         self.mode = tk.StringVar(value=config.mode)
         self._section(page, "DECK")
-        SegmentedControl(page, [("configured", "One deck"), ("random", "Random")], self.mode).pack(fill="x")
+        SegmentedControl(page, [("configured", "One deck"), ("random", "Random")], self.mode, self.scale).pack(fill="x")
         self.mode.trace_add("write", lambda *_: self._on_mode_change())
         self._build_deck_pickers(page)
 
@@ -1524,6 +1682,13 @@ class SettingsWindow:
             self.return_when_done, self.scale,
         ).pack(fill="x")
         self.return_when_done.trace_add("write", lambda *_: self.persist())
+        self.sound_on_open = tk.BooleanVar(value=config.sound_on_open)
+        ToggleRow(
+            page, "Play a sound when Anki opens",
+            "A short chime as your card pops up.",
+            self.sound_on_open, self.scale,
+        ).pack(fill="x", pady=(self.px(8), 0))
+        self.sound_on_open.trace_add("write", lambda *_: self._on_sound_toggle())
         self.start_with_windows = tk.BooleanVar(value=starts_with_windows())
         ToggleRow(
             page, START_AT_LOGIN_LABEL,
@@ -1536,7 +1701,7 @@ class SettingsWindow:
 
         footer = tk.Frame(page, bg=COLORS["background"])
         footer.pack(fill="x", pady=(self.px(16), 0))
-        flat_button(footer, "Try it: open Anki now", self.test_now, primary=True).pack(side="left")
+        RoundedButton(footer, "Try it: open Anki now", self.test_now, self.scale).pack(side="left")
         tk.Label(
             footer, text="Saved automatically", font=FONT_SMALL,
             fg=COLORS["muted"], bg=COLORS["background"],
@@ -1650,7 +1815,10 @@ class SettingsWindow:
         self.last_event.grid_remove()  # shown once something has happened
         wrap_to_width(self.last_event, card, text_margin)
         card.columnconfigure(1, weight=1)
-        self.toggle_button = flat_button(card, "", lambda: self.set_monitoring(not self.config.enabled))
+        self.toggle_button = RoundedButton(
+            card, "Pause", lambda: self.set_monitoring(not self.config.enabled), self.scale,
+            variant="secondary", min_text="Resume",
+        )
         self.toggle_button.grid(row=0, column=2, rowspan=3, sticky="e")
         self._render_status()
 
@@ -1696,6 +1864,11 @@ class SettingsWindow:
         refresh.bind("<Button-1>", lambda _: self.refresh_decks())
 
     # ---- behaviour --------------------------------------------------------
+
+    def _on_sound_toggle(self) -> None:
+        self.persist()
+        if self.sound_on_open.get():
+            play_open_sound()  # let people hear what they turned on
 
     def _on_mode_change(self) -> None:
         if self.mode.get() == "random":
@@ -1767,9 +1940,10 @@ class SettingsWindow:
             )
 
     def persist(self) -> None:
-        if not hasattr(self, "return_when_done"):
+        if not hasattr(self, "sound_on_open"):
             return  # still constructing
         self.config.return_when_done = self.return_when_done.get()
+        self.config.sound_on_open = self.sound_on_open.get()
         self.config.mode = self.mode.get()
         self.config.configured_deck = self.configured_deck.get().strip()
         if self.deck_names:
@@ -1791,7 +1965,7 @@ class SettingsWindow:
         self.status_dot.delete("all")
         self.status_dot.create_oval(1, 1, size - 1, size - 1, fill=color, outline=color)
         self.status_title.configure(text="Watching for AI" if enabled else "Paused")
-        self.toggle_button.configure(text="Pause" if enabled else "Resume")
+        self.toggle_button.set_text("Pause" if enabled else "Resume")
 
     def _poll(self) -> None:
         while True:
