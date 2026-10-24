@@ -7,7 +7,9 @@ puts that time to use: **when you send a prompt, Anki pops up with a card.
 When the AI finishes answering, Anki hides and your chat comes back.**
 
 Works with ChatGPT, Claude, Gemini, Copilot, Perplexity, DeepSeek, Grok and
-more, in any major browser or in the desktop apps. Windows only.
+more, in any major browser or in the desktop apps. Vibe coding? It also works
+with the AI chat inside **VS Code** (Claude Code, Copilot), **Cursor**,
+**Windsurf**, **Trae** and **Kiro**. Windows only.
 
 ![Demo: send a prompt, Anki pops up, then hides when the answer is ready](assets/screenshots/demo.gif)
 

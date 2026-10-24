@@ -98,6 +98,16 @@ DEFAULT_AI_SITES = [
     "poe.com",
 ]
 DEFAULT_AI_APPS = ["claude.exe", "chatgpt.exe", "perplexity.exe"]
+# Code editors with built-in AI chat (Claude Code, Copilot, Cursor...). Enter is
+# pressed constantly while coding, so here a prompt only counts once the AI's
+# Stop button actually appears.
+DEFAULT_IDE_APPS = [
+    "code.exe", "code - insiders.exe", "cursor.exe", "windsurf.exe", "trae.exe", "kiro.exe",
+]
+IDE_NAMES = {
+    "code.exe": "VS Code", "code - insiders.exe": "VS Code Insiders", "cursor.exe": "Cursor",
+    "windsurf.exe": "Windsurf", "trae.exe": "Trae", "kiro.exe": "Kiro",
+}
 # Used only when a browser's address bar cannot be read.
 AI_TITLE_HINTS = [
     "chatgpt", "claude", "gemini", "copilot", "perplexity", "deepseek", "grok",
@@ -120,6 +130,8 @@ STOP_BUTTON_PREFIXES = (
 STOP_BUTTON_EXCLUDED_WORDS = (
     "dict", "voice", "voz", "record", "grab", "audio", "listen", "escuch",
     "aloud", "share", "compart",
+    # IDE controls that are not the AI: the debugger's "Stop (Shift+F5)" etc.
+    "f5", "debug", "task", "terminal",
 )
 
 
@@ -134,6 +146,7 @@ class Config:
     cooldown_seconds: int = 0
     ai_sites: list[str] = field(default_factory=lambda: DEFAULT_AI_SITES.copy())
     ai_apps: list[str] = field(default_factory=lambda: DEFAULT_AI_APPS.copy())
+    ide_apps: list[str] = field(default_factory=lambda: DEFAULT_IDE_APPS.copy())
     anki_path: str = ""
 
 
@@ -150,6 +163,7 @@ def load_config() -> Config:
     config.random_decks = [str(deck) for deck in config.random_decks]
     config.ai_sites = [str(site).lower() for site in config.ai_sites]
     config.ai_apps = [str(app).lower() for app in config.ai_apps]
+    config.ide_apps = [str(app).lower() for app in config.ide_apps]
     config.cooldown_seconds = max(0, int(config.cooldown_seconds))
     return config
 
@@ -205,6 +219,11 @@ if sys.platform == "win32":
     user32.SetForegroundWindow.argtypes = [wintypes.HWND]
     user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
     user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+    user32.EnumChildWindows.argtypes = [wintypes.HWND, WNDENUMPROC, wintypes.LPARAM]
+    user32.SendMessageTimeoutW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        wintypes.UINT, wintypes.UINT, ctypes.c_void_p,
+    ]
     user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
     user32.GetAsyncKeyState.restype = ctypes.c_short
     user32.GetParent.argtypes = [wintypes.HWND]
@@ -248,6 +267,10 @@ KEYEVENTF_KEYUP = 0x0002
 LLKHF_INJECTED = 0x10
 SW_MINIMIZE = 6
 SW_RESTORE = 9
+WM_GETOBJECT = 0x003D
+OBJID_CLIENT = -4
+UIA_ROOT_OBJECT_ID = -25
+SMTO_ABORTIFHUNG = 0x0002
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 ERROR_ALREADY_EXISTS = 183
 EVENT_MODIFY_STATE = 0x0002
@@ -601,6 +624,7 @@ class AIWindowDetector:
         self._address_bars: dict[int, object] = {}
         self._urls: dict[int, tuple[str, str, float]] = {}
         self._exe_names: dict[int, str] = {}
+        self._accessibility_enabled: set[int] = set()
         if comtypes is None:
             return
         try:
@@ -663,20 +687,46 @@ class AIWindowDetector:
         self._urls[hwnd] = (title, url, time.monotonic())
         return url
 
+    def _enable_accessibility(self, hwnd: int) -> None:
+        """Ask Chromium/Electron windows to expose their page, as a screen reader would.
+
+        VS Code, Cursor and other Electron apps keep their UI hidden from UI
+        Automation until someone asks for it with WM_GETOBJECT.
+        """
+        if hwnd in self._accessibility_enabled:
+            return
+        self._accessibility_enabled.add(hwnd)
+        targets = [hwnd]
+
+        @WNDENUMPROC
+        def visit(child: int, _: int) -> bool:
+            if window_class(child) == "Chrome_RenderWidgetHostHWND":
+                targets.append(child)
+            return True
+
+        user32.EnumChildWindows(hwnd, visit, 0)
+        for target in targets:
+            for object_id in (OBJID_CLIENT, UIA_ROOT_OBJECT_ID):
+                user32.SendMessageTimeoutW(target, WM_GETOBJECT, 0, object_id, SMTO_ABORTIFHUNG, 500, None)
+
+    def is_ide(self, hwnd: int, config: Config) -> bool:
+        return self.exe_name(hwnd) in config.ide_apps
+
     def is_generating(self, hwnd: int) -> bool:
-        """True while the chat page in hwnd shows a Stop button."""
+        """True while the chat in hwnd shows a Stop button."""
         if self._uia is None:
             return False
         uia = self._uia_module
         try:
-            # Search only the page: the browser's own "Stop loading" button
-            # lives in the toolbar.
-            document = self._uia.ElementFromHandle(hwnd).FindFirst(
-                uia.TreeScope_Descendants, self._document_condition
-            )
-            if not document:
-                return False
-            buttons = document.FindAllBuildCache(
+            self._enable_accessibility(hwnd)
+            scope = self._uia.ElementFromHandle(hwnd)
+            if self.exe_name(hwnd) in BROWSERS:
+                # Search only the page: the browser's own "Stop loading"
+                # button lives in the toolbar.
+                scope = scope.FindFirst(uia.TreeScope_Descendants, self._document_condition)
+                if not scope:
+                    return False
+            buttons = scope.FindAllBuildCache(
                 uia.TreeScope_Descendants, self._button_condition, self._name_cache
             )
             return any(
@@ -694,6 +744,9 @@ class AIWindowDetector:
         exe = self.exe_name(hwnd)
         if exe in config.ai_apps:
             return f"{exe.removesuffix('.exe')} app", exe.removesuffix(".exe")
+        if exe in config.ide_apps:
+            name = IDE_NAMES.get(exe, exe.removesuffix(".exe"))
+            return f"{name} (AI coding)", name
         if exe in BROWSERS:
             browser = BROWSERS[exe]
             host = host_of(self.browser_url(hwnd, title))
@@ -789,7 +842,16 @@ class Monitor:
         detector = AIWindowDetector()
         own_pid = os.getpid()
         next_generation_scan = 0.0
-        last_click: tuple[Optional[int], float] = (None, 0.0)
+        # A click or IDE Enter that may have sent a prompt; confirmed once the
+        # AI's Stop button appears shortly after.
+        pending: tuple[Optional[int], float] = (None, 0.0)
+
+        def arm(hwnd: int) -> tuple[Optional[int], float]:
+            # If the AI was already answering, this press didn't start it.
+            if self._session is None and not detector.is_generating(hwnd):
+                return hwnd, time.monotonic()
+            return pending
+
         while not self.stop_event.is_set():
             try:
                 hwnd = self._enter_presses.get(timeout=0.25)
@@ -798,24 +860,28 @@ class Monitor:
             now = time.monotonic()
             if hwnd:
                 _, ai_name = detector.describe(hwnd, self.config)
-                if ai_name:
+                if ai_name and detector.is_ide(hwnd, self.config):
+                    pending = arm(hwnd)  # Enter is also used for coding
+                elif ai_name:
                     self._start_session(hwnd, f"prompt sent in {ai_name}", PROMPT_SEND_DELAY_SECONDS)
             while not self._clicks.empty():
-                last_click = (self._clicks.get_nowait(), now)
+                clicked = self._clicks.get_nowait()
+                if detector.describe(clicked, self.config)[1]:
+                    pending = arm(clicked)
 
             foreground = user32.GetForegroundWindow()
             if foreground and window_pid(foreground) != own_pid:
                 description, ai_name = detector.describe(foreground, self.config)
                 self.current_window = description
                 self.current_is_ai = ai_name is not None
-                clicked_here = last_click[0] == foreground and now - last_click[1] < CLICK_SEND_WINDOW_SECONDS
-                if ai_name and clicked_here and self._session is None and now >= next_generation_scan:
-                    # A click (e.g. on the send button) followed by the AI
-                    # starting to answer. The AI resuming on its own between
-                    # steps is not a new prompt, so it never reopens Anki.
-                    next_generation_scan = now + 0.5
+                armed_here = pending[0] == foreground and now - pending[1] < CLICK_SEND_WINDOW_SECONDS
+                if ai_name and armed_here and self._session is None and now >= next_generation_scan:
+                    # The user's click/Enter followed by the AI starting to
+                    # answer. The AI resuming on its own between steps is not
+                    # a new prompt, so it never reopens Anki.
+                    next_generation_scan = now + 0.4
                     if detector.is_generating(foreground):
-                        last_click = (None, 0.0)
+                        pending = (None, 0.0)
                         self._start_session(foreground, f"prompt sent in {ai_name}")
 
             if self._session is not None and now >= self._session.next_check:
