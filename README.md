@@ -2,6 +2,13 @@
 
 ![Always Learn](assets/banner.png)
 
+<p align="center">
+  <a href="https://github.com/EduSR9/always-learn/releases/latest/download/always-learn.exe"><img src="https://img.shields.io/badge/Download_for-Windows-0078D6?style=for-the-badge&logo=windows11&logoColor=white" alt="Download for Windows" height="48"></a>
+  &nbsp;
+  <a href="https://github.com/EduSR9/always-learn/releases/latest/download/always-learn-mac-beta.dmg"><img src="https://img.shields.io/badge/Download_for-Mac_(beta)-111111?style=for-the-badge&logo=apple&logoColor=white" alt="Download for Mac (beta)" height="48"></a>
+</p>
+<p align="center"><sub>Free · Click a button and the download starts · <a href="#install-in-3-steps">How to install</a></sub></p>
+
 **Stop scrolling while the AI thinks.** Every prompt you send, mid-vibe-coding or
 mid-chat, comes with a wait, and that wait usually turns into a scroll. Always
 Learn turns it into learning: **when you send a prompt, Anki pops up with a card.
@@ -15,25 +22,47 @@ in any major browser or desktop app, and with the AI chat inside **VS Code**
 
 <img src="assets/screenshots/settings.png" width="420" alt="Always Learn settings window">
 
-## Install
+## Install in 3 steps
 
-First install [Anki](https://apps.ankiweb.net/) and its
-[AnkiConnect](https://ankiweb.net/shared/info/2055492159) add-on (in Anki:
-**Tools → Add-ons → Get Add-ons…**, code `2055492159`), then restart Anki.
+**1. Get Anki** (the free flashcard app), if you don't have it yet:
+download it from [apps.ankiweb.net](https://apps.ankiweb.net/) and install it.
 
-**Windows:** download **always-learn.exe** from the
-[Releases page](https://github.com/EduSR9/always-learn/releases) and
-double-click it. If Windows warns about an unknown app, click
-**More info → Run anyway**.
+**2. Add AnkiConnect to Anki** (lets Always Learn open your cards):
+open Anki → **Tools → Add-ons → Get Add-ons…** → paste the code
+`2055492159` → **OK** → close and reopen Anki.
 
-**macOS (beta):** download **always-learn-mac-beta.dmg** from the
-[Releases page](https://github.com/EduSR9/always-learn/releases), drag
-*Always Learn* into Applications, then right-click it → **Open** the first
-time. Allow it under System Settings → Privacy & Security →
-**Accessibility** and **Input Monitoring**. The Mac version is new, so please
-[report any problems](https://github.com/EduSR9/always-learn/issues).
+**3. Install Always Learn:**
 
-Then pick your deck and click **Try it: open Anki now**.
+<table>
+<tr><th>🪟 Windows</th><th>🍎 Mac (beta)</th></tr>
+<tr valign="top"><td>
+
+1. Click **[Download for Windows](https://github.com/EduSR9/always-learn/releases/latest/download/always-learn.exe)**.
+2. Open the downloaded file `always-learn.exe`.
+3. If a blue "Windows protected your PC" box appears, click
+   **More info**, then **Run anyway**. (It's shown for any new app
+   that isn't from a big company.)
+
+</td><td>
+
+1. Click **[Download for Mac](https://github.com/EduSR9/always-learn/releases/latest/download/always-learn-mac-beta.dmg)**.
+2. Open the downloaded file and drag **Always Learn** into
+   the **Applications** folder.
+3. Open Applications, **right-click** Always Learn → **Open** →
+   **Open** (only needed the first time).
+4. When asked, allow it in **System Settings → Privacy & Security**
+   under **Accessibility** and **Input Monitoring**, then open it again.
+
+</td></tr>
+</table>
+
+That's it: pick your deck in the window that opens and click
+**Try it: open Anki now**. From now on, Anki pops up every time you send a
+prompt to an AI.
+
+> The Mac version is brand new. If something doesn't work,
+> [tell us here](https://github.com/EduSR9/always-learn/issues/new) (a free
+> GitHub account is needed).
 
 ## Using it
 
