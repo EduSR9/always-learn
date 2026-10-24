@@ -119,18 +119,20 @@ DEFAULT_AI_SITES = [
 ]
 # Windows executables and macOS app names (lowercase).
 DEFAULT_AI_APPS = ["claude.exe", "chatgpt.exe", "perplexity.exe", "claude", "chatgpt", "perplexity"]
-# Code editors with built-in AI chat (Claude Code, Copilot, Cursor...). Enter is
-# pressed constantly while coding, so here a prompt only counts once the AI's
-# Stop button actually appears.
+# Apps with a built-in AI chat where Enter is also used for typing: code
+# editors (Claude Code, Copilot, Cursor...) and Obsidian (Copilot plugin). Here a
+# prompt only counts once the AI's Stop button actually appears.
 DEFAULT_IDE_APPS = [
     "code.exe", "code - insiders.exe", "cursor.exe", "windsurf.exe", "trae.exe", "kiro.exe",
     "code", "visual studio code", "code - insiders", "cursor", "windsurf", "trae", "kiro",
+    "obsidian.exe", "obsidian",
 ]
 IDE_NAMES = {
     "code.exe": "VS Code", "code - insiders.exe": "VS Code Insiders", "cursor.exe": "Cursor",
     "windsurf.exe": "Windsurf", "trae.exe": "Trae", "kiro.exe": "Kiro",
     "code": "VS Code", "visual studio code": "VS Code", "code - insiders": "VS Code Insiders",
     "cursor": "Cursor", "windsurf": "Windsurf", "trae": "Trae", "kiro": "Kiro",
+    "obsidian.exe": "Obsidian", "obsidian": "Obsidian",
 }
 # Used only when a browser's address bar cannot be read.
 AI_TITLE_HINTS = [
@@ -176,6 +178,11 @@ class Config:
     anki_path: str = ""
 
 
+def merge_defaults(saved: list, defaults: list[str]) -> list[str]:
+    items = [str(item).lower() for item in saved]
+    return items + [item for item in defaults if item not in items]
+
+
 def load_config() -> Config:
     if not CONFIG_PATH.exists():
         return Config()
@@ -187,9 +194,10 @@ def load_config() -> Config:
     known = {item.name for item in fields(Config)}
     config = Config(**{key: value for key, value in data.items() if key in known})
     config.random_decks = [str(deck) for deck in config.random_decks]
-    config.ai_sites = [str(site).lower() for site in config.ai_sites]
-    config.ai_apps = [str(app).lower() for app in config.ai_apps]
-    config.ide_apps = [str(app).lower() for app in config.ide_apps]
+    # Saved lists keep the user's own additions; newly added defaults are merged in.
+    config.ai_sites = merge_defaults(config.ai_sites, DEFAULT_AI_SITES)
+    config.ai_apps = merge_defaults(config.ai_apps, DEFAULT_AI_APPS)
+    config.ide_apps = merge_defaults(config.ide_apps, DEFAULT_IDE_APPS)
     config.cooldown_seconds = max(0, int(config.cooldown_seconds))
     return config
 
@@ -974,8 +982,11 @@ class AIWindowDetector:
         if exe in config.ai_apps:
             return f"{exe.removesuffix('.exe')} app", exe.removesuffix(".exe")
         if exe in config.ide_apps:
+            # Electron apps build their accessibility tree lazily; start now so
+            # the Stop button is visible by the time a prompt is sent.
+            self._enable_accessibility(hwnd)
             name = IDE_NAMES.get(exe, exe.removesuffix(".exe"))
-            return f"{name} (AI coding)", name
+            return f"{name} (AI chat inside)", name
         if exe in BROWSERS:
             browser = BROWSERS[exe]
             host = host_of(self.browser_url(hwnd, title))
@@ -1271,7 +1282,7 @@ if IS_MAC:
                 return f"{app_name(pid)} app", name
             if name in config.ide_apps:
                 label = IDE_NAMES.get(name, app_name(pid))
-                return f"{label} (AI coding)", label
+                return f"{label} (AI chat inside)", label
             if name in MAC_BROWSERS:
                 browser = MAC_BROWSERS[name][0]
                 host = host_of(self.browser_url(pid, name))
