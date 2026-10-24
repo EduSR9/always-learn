@@ -58,7 +58,10 @@ PROMPT_SEND_DELAY_SECONDS = 0.4
 # How long to wait for the AI's Stop button to appear after a prompt is sent.
 GENERATION_START_TIMEOUT_SECONDS = 20
 # The Stop button must be gone this long before the answer counts as finished.
-GENERATION_END_GRACE_SECONDS = 1.0
+# Agentic/coding AIs briefly hide it between steps while they "think out loud".
+GENERATION_END_GRACE_SECONDS = 3.0
+# A click only counts as sending a prompt if the AI starts answering this soon.
+CLICK_SEND_WINDOW_SECONDS = 3.0
 
 COLORS = {
     "background": "#0E1117",
@@ -155,11 +158,13 @@ def save_config(config: Config) -> None:
     CONFIG_PATH.write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
 
 
-def choose_deck(config: Config) -> str:
+def choose_deck(config: Config, previous: Optional[str] = None) -> str:
     if config.mode == "random":
         if not config.random_decks:
-            raise ValueError("Select at least one deck for random mode.")
-        return random.choice(config.random_decks)
+            raise ValueError("Tick at least one deck for random mode.")
+        # Never repeat the previous deck, so the decks visibly rotate.
+        others = [deck for deck in config.random_decks if deck != previous]
+        return random.choice(others or config.random_decks)
     if not config.configured_deck:
         raise ValueError("Choose an Anki deck first.")
     return config.configured_deck
@@ -230,6 +235,8 @@ if sys.platform == "win32":
     kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
 WH_KEYBOARD_LL = 13
+WH_MOUSE_LL = 14
+WM_LBUTTONDOWN = 0x0201
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 WM_QUIT = 0x0012
@@ -722,15 +729,17 @@ class Monitor:
         self.current_window = "Waiting for the first window…"
         self.current_is_ai = False
         self._enter_presses: "queue.Queue[int]" = queue.Queue()
+        self._clicks: "queue.Queue[int]" = queue.Queue()
         self._launch_lock = threading.Lock()
         self._last_trigger = 0.0
+        self._last_deck: Optional[str] = None
         self._hook_thread_id = 0
         self._session: Optional[StudySession] = None
 
     def start(self) -> None:
         if sys.platform != "win32":
             return
-        threading.Thread(target=self._run_keyboard_hook, daemon=True).start()
+        threading.Thread(target=self._run_input_hooks, daemon=True).start()
         threading.Thread(target=self._run, daemon=True).start()
 
     def stop(self) -> None:
@@ -738,7 +747,8 @@ class Monitor:
         if self._hook_thread_id:
             user32.PostThreadMessageW(self._hook_thread_id, WM_QUIT, 0, 0)
 
-    def _run_keyboard_hook(self) -> None:
+    def _run_input_hooks(self) -> None:
+        """Watch Enter presses and left clicks; never what is typed."""
         self._hook_thread_id = kernel32.GetCurrentThreadId()
         enter_down = False
 
@@ -757,19 +767,29 @@ class Monitor:
                         enter_down = False
             return user32.CallNextHookEx(None, code, message, data)
 
-        hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, on_key, kernel32.GetModuleHandleW(None), 0)
-        if not hook:
+        @HOOKPROC
+        def on_mouse(code: int, message: int, data: int) -> int:
+            if code == 0 and message == WM_LBUTTONDOWN:
+                self._clicks.put(user32.GetForegroundWindow())
+            return user32.CallNextHookEx(None, code, message, data)
+
+        module = kernel32.GetModuleHandleW(None)
+        keyboard_hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, on_key, module, 0)
+        mouse_hook = user32.SetWindowsHookExW(WH_MOUSE_LL, on_mouse, module, 0)
+        if not keyboard_hook:
             self.on_event("error", "Could not watch the Enter key; prompt detection is off.")
-            return
         message = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
             pass
-        user32.UnhookWindowsHookEx(hook)
+        for hook in (keyboard_hook, mouse_hook):
+            if hook:
+                user32.UnhookWindowsHookEx(hook)
 
     def _run(self) -> None:
         detector = AIWindowDetector()
         own_pid = os.getpid()
         next_generation_scan = 0.0
+        last_click: tuple[Optional[int], float] = (None, 0.0)
         while not self.stop_event.is_set():
             try:
                 hwnd = self._enter_presses.get(timeout=0.25)
@@ -780,17 +800,23 @@ class Monitor:
                 _, ai_name = detector.describe(hwnd, self.config)
                 if ai_name:
                     self._start_session(hwnd, f"prompt sent in {ai_name}", PROMPT_SEND_DELAY_SECONDS)
+            while not self._clicks.empty():
+                last_click = (self._clicks.get_nowait(), now)
 
             foreground = user32.GetForegroundWindow()
             if foreground and window_pid(foreground) != own_pid:
                 description, ai_name = detector.describe(foreground, self.config)
                 self.current_window = description
                 self.current_is_ai = ai_name is not None
-                if ai_name and self._session is None and now >= next_generation_scan:
-                    # Catches prompts sent with the mouse instead of Enter.
+                clicked_here = last_click[0] == foreground and now - last_click[1] < CLICK_SEND_WINDOW_SECONDS
+                if ai_name and clicked_here and self._session is None and now >= next_generation_scan:
+                    # A click (e.g. on the send button) followed by the AI
+                    # starting to answer. The AI resuming on its own between
+                    # steps is not a new prompt, so it never reopens Anki.
                     next_generation_scan = now + 0.5
                     if detector.is_generating(foreground):
-                        self._start_session(foreground, f"{ai_name} started answering")
+                        last_click = (None, 0.0)
+                        self._start_session(foreground, f"prompt sent in {ai_name}")
 
             if self._session is not None and now >= self._session.next_check:
                 self._update_session(detector, now)
@@ -845,7 +871,8 @@ class Monitor:
                 return  # a launch is already in progress
             try:
                 time.sleep(delay)
-                deck = choose_deck(self.config)
+                deck = choose_deck(self.config, self._last_deck)
+                self._last_deck = deck
                 self.on_event("busy", f"Opening {deck}…")
                 open_anki_deck(deck, self.config)
                 self.on_event("ok", f"{time.strftime('%H:%M')}  ·  {deck}")
@@ -1183,17 +1210,20 @@ class SettingsWindow:
         self.deck_combo.pack(side="left", fill="x", expand=True)
         self.configured_deck.trace_add("write", lambda *_: self.persist())
 
+        # A checklist: clicking a row ticks or unticks that deck.
         self.random_picker = tk.Frame(self.deck_area, bg=COLORS["background"])
+        self.deck_names: list[str] = []
+        self.ticked_decks = set(self.config.random_decks)
         self.random_list = tk.Listbox(
-            self.random_picker, selectmode="multiple", exportselection=False,
+            self.random_picker, selectmode="single", exportselection=False,
             height=4, font=FONT, activestyle="none", relief="flat", bd=0,
             bg=COLORS["surface_high"], fg=COLORS["text"],
-            selectbackground=COLORS["blue"], selectforeground=COLORS["on_blue"],
+            selectbackground=COLORS["surface_high"], selectforeground=COLORS["text"],
             highlightthickness=1, highlightbackground=COLORS["border"],
-            highlightcolor=COLORS["border"],
+            highlightcolor=COLORS["border"], cursor="hand2",
         )
         self.random_list.pack(side="left", fill="x", expand=True)
-        self.random_list.bind("<<ListboxSelect>>", lambda _: self.persist())
+        self.random_list.bind("<<ListboxSelect>>", lambda _: self._toggle_selected_deck())
 
         hint_row = tk.Frame(self.deck_area, bg=COLORS["background"])
         hint_row.pack(side="bottom", fill="x", pady=(self.px(5), 0))
@@ -1218,6 +1248,7 @@ class SettingsWindow:
             self.random_picker.pack_forget()
             self.single_picker.pack(fill="x")
         self.persist()
+        self._update_deck_hint()
 
     def refresh_decks(self) -> None:
         self.deck_hint.configure(text="Loading decks from Anki…", fg=COLORS["muted"])
@@ -1233,20 +1264,50 @@ class SettingsWindow:
         threading.Thread(target=load, daemon=True).start()
 
     def _fill_decks(self, decks: list[str]) -> None:
+        self.anki_reachable = bool(decks)
         if not decks:
             decks = sorted(set(self.config.random_decks + [self.config.configured_deck]) - {""})
-            self.deck_hint.configure(text="Open Anki to load your decks.", fg=COLORS["yellow"])
-        elif self.mode.get() == "random":
-            self.deck_hint.configure(text="Click to pick several decks.", fg=COLORS["muted"])
-        else:
-            self.deck_hint.configure(text=f"{len(decks)} decks in Anki", fg=COLORS["muted"])
         self.deck_combo.configure(values=decks)
-        chosen = set(self.config.random_decks)
+        self.deck_names = decks
+        self.ticked_decks &= set(decks)  # forget decks that no longer exist
         self.random_list.delete(0, "end")
-        for index, deck in enumerate(decks):
-            self.random_list.insert("end", deck)
-            if deck in chosen:
-                self.random_list.selection_set(index)
+        for index in range(len(decks)):
+            self.random_list.insert("end", "")
+            self._render_deck_row(index)
+        self.random_list.configure(height=min(max(len(decks), 2), 6))
+        self._update_deck_hint()
+
+    def _render_deck_row(self, index: int) -> None:
+        deck = self.deck_names[index]
+        ticked = deck in self.ticked_decks
+        self.random_list.delete(index)
+        self.random_list.insert(index, f"{'☑' if ticked else '☐'}  {deck}")
+        color = COLORS["text"] if ticked else COLORS["muted"]
+        self.random_list.itemconfigure(index, fg=color, selectforeground=color)
+
+    def _toggle_selected_deck(self) -> None:
+        selection = self.random_list.curselection()
+        if not selection:
+            return
+        index = selection[0]
+        self.ticked_decks ^= {self.deck_names[index]}
+        self._render_deck_row(index)
+        self.random_list.selection_clear(0, "end")
+        self.persist()
+        self._update_deck_hint()
+
+    def _update_deck_hint(self) -> None:
+        if not getattr(self, "anki_reachable", True):
+            self.deck_hint.configure(text="Open Anki to load your decks.", fg=COLORS["yellow"])
+        elif self.mode.get() != "random":
+            self.deck_hint.configure(text=f"{len(self.deck_names)} decks in Anki", fg=COLORS["muted"])
+        elif len(self.ticked_decks) < 2:
+            self.deck_hint.configure(text="Tick at least 2 decks to rotate between them.", fg=COLORS["yellow"])
+        else:
+            self.deck_hint.configure(
+                text=f"Random from {len(self.ticked_decks)} of {len(self.deck_names)} decks, never the same twice in a row",
+                fg=COLORS["muted"],
+            )
 
     def persist(self) -> None:
         if not hasattr(self, "return_when_done"):
@@ -1254,10 +1315,8 @@ class SettingsWindow:
         self.config.return_when_done = self.return_when_done.get()
         self.config.mode = self.mode.get()
         self.config.configured_deck = self.configured_deck.get().strip()
-        if self.random_list.size():
-            self.config.random_decks = [
-                self.random_list.get(index) for index in self.random_list.curselection()
-            ]
+        if self.deck_names:
+            self.config.random_decks = [deck for deck in self.deck_names if deck in self.ticked_decks]
         save_config(self.config)
 
     def set_monitoring(self, enabled: bool) -> None:

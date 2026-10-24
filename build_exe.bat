@@ -10,7 +10,7 @@ if not exist .venv\Scripts\python.exe (
 rem Generate the UI Automation bindings so they get bundled into the exe.
 .venv\Scripts\python.exe -c "import comtypes.client; comtypes.client.GetModule('UIAutomationCore.dll')" || goto :error
 
-.venv\Scripts\pyinstaller --noconfirm --onefile --windowed ^
+.venv\Scripts\python.exe -m PyInstaller --noconfirm --onefile --windowed ^
     --name always-learn ^
     --icon assets\icon.ico ^
     --add-data "assets;assets" ^
