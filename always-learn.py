@@ -7,8 +7,10 @@ import json
 import os
 import queue
 import random
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -20,6 +22,7 @@ from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import ttk
 from typing import Callable, Optional
+from xml.sax.saxutils import escape
 
 try:
     from PIL import Image, ImageDraw, ImageFilter, ImageTk
@@ -55,6 +58,10 @@ SOUND_PATH = ASSETS_DIR / "open.wav"
 CONFIG_PATH = Path.home() / ".always-learn.json"
 STARTUP_FLAG = "--startup"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_TASK_NAME = APP_NAME
+# Where the startup copy of the app lives (outside Downloads/OneDrive).
+INSTALL_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Programs" / APP_NAME
+INSTALLED_EXE = INSTALL_DIR / "always-learn.exe"
 SHOW_EVENT_NAME = "Local\\always-learn-show-window"
 ANKI_CONNECT_URL = "http://127.0.0.1:8765"
 ANKI_STARTUP_TIMEOUT_SECONDS = 60
@@ -484,7 +491,69 @@ def launch_target() -> tuple[str, list[str]]:
     return str(pythonw if pythonw.exists() else sys.executable), [str(Path(__file__).resolve())]
 
 
-def starts_with_windows() -> bool:
+def _run_hidden(command: list[str]) -> subprocess.CompletedProcess:
+    """Run a console tool without flashing a console window."""
+    return subprocess.run(
+        command, capture_output=True, text=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+
+def install_for_startup() -> Path:
+    """Copy the exe to a normal app folder and return that copy.
+
+    Downloads and OneDrive folders can be slow to open right after sign-in, so
+    the startup task runs this copy instead. It is refreshed whenever a newer
+    download is opened.
+    """
+    current = Path(sys.executable)
+    if current.resolve() == INSTALLED_EXE.resolve():
+        return INSTALLED_EXE
+    try:
+        INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+        if not INSTALLED_EXE.exists() or (
+            (INSTALLED_EXE.stat().st_size, INSTALLED_EXE.stat().st_mtime)
+            != (current.stat().st_size, current.stat().st_mtime)
+        ):
+            shutil.copy2(current, INSTALLED_EXE)
+        return INSTALLED_EXE
+    except OSError as exc:  # e.g. the installed copy is running right now
+        print(f"Always Learn: could not copy to {INSTALL_DIR}: {exc}", file=sys.stderr)
+        return INSTALLED_EXE if INSTALLED_EXE.exists() else current
+
+
+def _startup_task_xml(program: str, arguments: str) -> str:
+    user = escape(f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}")
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Starts Always Learn when you sign in.</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers>
+  <Principals>
+    <Principal id="Author"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <Priority>4</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec><Command>{escape(program)}</Command><Arguments>{escape(arguments)}</Arguments></Exec>
+  </Actions>
+</Task>"""
+
+
+def _remove_legacy_run_entry() -> None:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, APP_NAME)
+    except OSError:
+        pass
+
+
+def _has_legacy_run_entry() -> bool:
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
             winreg.QueryValueEx(key, APP_NAME)
@@ -493,17 +562,43 @@ def starts_with_windows() -> bool:
         return False
 
 
+def starts_with_windows() -> bool:
+    task = _run_hidden(["schtasks", "/Query", "/TN", STARTUP_TASK_NAME])
+    return task.returncode == 0 or _has_legacy_run_entry()
+
+
 def set_start_with_windows(enabled: bool) -> None:
+    """Start at sign-in through Task Scheduler, which runs right after sign-in
+    instead of waiting in Windows' delayed startup-apps queue."""
+    if not enabled:
+        _run_hidden(["schtasks", "/Delete", "/TN", STARTUP_TASK_NAME, "/F"])
+        _remove_legacy_run_entry()
+        return
+    if FROZEN:
+        program, arguments = str(install_for_startup()), [STARTUP_FLAG]
+    else:
+        program, script = launch_target()
+        arguments = [*script, STARTUP_FLAG]
+    task_file = Path(tempfile.gettempdir()) / "always-learn-task.xml"
+    task_file.write_text(_startup_task_xml(program, subprocess.list2cmdline(arguments)), encoding="utf-16")
+    try:
+        created = _run_hidden(["schtasks", "/Create", "/TN", STARTUP_TASK_NAME, "/XML", str(task_file), "/F"])
+    finally:
+        task_file.unlink(missing_ok=True)
+    if created.returncode == 0:
+        _remove_legacy_run_entry()
+        return
+    # Fall back to the classic startup entry if Task Scheduler is unavailable.
+    print(f"Always Learn: Task Scheduler failed: {created.stderr.strip()}", file=sys.stderr)
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
-        if enabled:
-            program, arguments = launch_target()
-            command = subprocess.list2cmdline([program, *arguments, STARTUP_FLAG])
-            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, command)
-        else:
-            try:
-                winreg.DeleteValue(key, APP_NAME)
-            except FileNotFoundError:
-                pass
+        winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, subprocess.list2cmdline([program, *arguments]))
+
+
+def refresh_start_at_login() -> None:
+    """Keep an enabled startup entry current: move old startup-list entries to
+    Task Scheduler and point it at the newest copy of the app."""
+    if starts_with_windows():
+        set_start_with_windows(True)
 
 
 def create_desktop_shortcut() -> Optional[Path]:
@@ -571,7 +666,7 @@ def find_anki_executable(config: Config) -> Optional[Path]:
     return next((path for path in candidates if path.is_file()), None)
 
 
-def launch_anki(config: Config) -> None:
+def launch_anki(config: Config, background: bool = False) -> None:
     executable = find_anki_executable(config)
     if executable is None:
         raise RuntimeError(
@@ -598,12 +693,35 @@ def wait_for_anki_connect(timeout: float) -> bool:
     return False
 
 
+_anki_launched_at = 0.0
+_anki_launch_lock = threading.Lock()
+
+
+def anki_process_running() -> bool:
+    """Anki can be running (still loading) before its window appears."""
+    result = _run_hidden(["tasklist", "/FI", "IMAGENAME eq anki.exe", "/NH"])
+    return "anki.exe" in result.stdout.lower()
+
+
+def ensure_anki_running(config: Config, background: bool = False) -> bool:
+    """Start Anki unless it is already running or starting. Returns True if it
+    was launched now. Two copies would fight over the collection ("Anki already
+    open"), so this is the only place that launches Anki."""
+    global _anki_launched_at
+    with _anki_launch_lock:
+        recently_launched = time.monotonic() - _anki_launched_at < ANKI_STARTUP_TIMEOUT_SECONDS
+        if recently_launched or find_anki_window() or anki_process_running():
+            return False
+        launch_anki(config, background=background)
+        _anki_launched_at = time.monotonic()
+        return True
+
+
 def start_anki_in_background(config: Config) -> None:
     """Launch Anki at login and minimize it, so later reviews open instantly."""
-    if find_anki_window():
-        return
     try:
-        launch_anki(config)
+        if not ensure_anki_running(config, background=True):
+            return
     except RuntimeError as exc:
         print(f"Always Learn: {exc}", file=sys.stderr)
         return
@@ -644,15 +762,16 @@ def open_anki_deck(deck_name: str, config: Config) -> None:
     try:
         anki_connect("version", timeout=1)
     except AnkiUnavailable:
-        anki_window = find_anki_window()
-        if anki_window:
-            bring_window_to_front(anki_window)
-            raise RuntimeError(
-                "Anki is open but AnkiConnect is not responding. "
-                "Install the AnkiConnect add-on and restart Anki."
-            )
-        launch_anki(config)
+        # Not answering yet: start Anki if needed, or wait while it loads.
+        ensure_anki_running(config)
         if not wait_for_anki_connect(ANKI_STARTUP_TIMEOUT_SECONDS):
+            anki_window = find_anki_window()
+            if anki_window:
+                bring_window_to_front(anki_window)
+                raise RuntimeError(
+                    "Anki is open but AnkiConnect is not responding. "
+                    "Install the AnkiConnect add-on and restart Anki."
+                )
             raise RuntimeError(
                 "Anki did not become ready in time. Is the AnkiConnect add-on installed?"
             )
@@ -1037,11 +1156,12 @@ if IS_MAC:
                 f'"anki_path" in {CONFIG_PATH}.'
             )
 
+    def anki_process_running() -> bool:
+        return find_anki_window() is not None  # checks running apps, not windows
+
     def start_anki_in_background(config: Config) -> None:
-        if find_anki_window():
-            return
         try:
-            launch_anki(config, background=True)
+            ensure_anki_running(config, background=True)  # `open -g -j` starts it hidden
         except RuntimeError as exc:
             print(f"Always Learn: {exc}", file=sys.stderr)
 
@@ -1696,7 +1816,10 @@ class SettingsWindow:
             self.start_with_windows, self.scale,
         ).pack(fill="x", pady=(self.px(8), 0))
         self.start_with_windows.trace_add(
-            "write", lambda *_: set_start_with_windows(self.start_with_windows.get())
+            "write",
+            lambda *_: threading.Thread(
+                target=set_start_with_windows, args=(self.start_with_windows.get(),), daemon=True
+            ).start(),
         )
 
         footer = tk.Frame(page, bg=COLORS["background"])
@@ -2114,6 +2237,8 @@ def main() -> None:
     tray_icon = create_tray_icon(root, config, settings, monitor)
     settings.tray_icon = tray_icon
     listen_for_show_requests(lambda: root.after(0, settings.show))
+    if not at_login:
+        threading.Thread(target=refresh_start_at_login, daemon=True).start()
     if at_login:
         root.withdraw()
         threading.Thread(target=start_anki_in_background, args=(config,), daemon=True).start()
