@@ -73,6 +73,9 @@ GENERATION_START_TIMEOUT_SECONDS = 20
 GENERATION_END_GRACE_SECONDS = 3.0
 # A click only counts as sending a prompt if the AI starts answering this soon.
 CLICK_SEND_WINDOW_SECONDS = 3.0
+# How often to check, in the background, whether the AI in the front window is
+# already working (so presses made while it works aren't taken as new prompts).
+IDLE_CHECK_SECONDS = 2.0
 
 COLORS = {
     "background": "#0E1117",
@@ -882,11 +885,12 @@ def matches_site(host: str, sites: list[str]) -> Optional[str]:
     return next((site for site in sites if host == site or host.endswith("." + site)), None)
 
 
-def is_stop_button(name: str) -> bool:
+def is_stop_button(name: str, in_editor: bool = False) -> bool:
+    """True for an AI chat's stop button. Inside editors, Copilot Chat calls it
+    "Cancel"; on web pages that word is too common to count."""
     name = name.strip().lower()
-    return name.startswith(STOP_BUTTON_PREFIXES) and not any(
-        word in name for word in STOP_BUTTON_EXCLUDED_WORDS
-    )
+    prefixes = STOP_BUTTON_PREFIXES + (("cancel",) if in_editor else ())
+    return name.startswith(prefixes) and not any(word in name for word in STOP_BUTTON_EXCLUDED_WORDS)
 
 
 class AIWindowDetector:
@@ -1003,8 +1007,9 @@ class AIWindowDetector:
             buttons = scope.FindAllBuildCache(
                 uia.TreeScope_Descendants, self._button_condition, self._name_cache
             )
+            in_editor = self.exe_name(hwnd) not in BROWSERS
             return any(
-                is_stop_button(buttons.GetElement(index).CachedName or "")
+                is_stop_button(buttons.GetElement(index).CachedName or "", in_editor)
                 for index in range(buttons.Length)
             )
         except (OSError, comtypes.COMError):
@@ -1364,7 +1369,7 @@ if IS_MAC:
                 in_page = in_page or role == "AXWebArea"
                 if in_page and role == "AXButton":
                     for label in (title, description):
-                        if isinstance(label, str) and is_stop_button(label):
+                        if isinstance(label, str) and is_stop_button(label, not in_browser):
                             return True
                 if children is not None and not isinstance(children, str):
                     try:
@@ -1397,14 +1402,17 @@ class Monitor:
         self.stop_event = threading.Event()
         self.current_window = "Waiting for the first window…"
         self.current_is_ai = False
-        self._enter_presses: "queue.Queue[int]" = queue.Queue()
-        self._clicks: "queue.Queue[int]" = queue.Queue()
+        # (window, moment of the press) for every Enter press and left click.
+        self._enter_presses: "queue.Queue[tuple[int, float]]" = queue.Queue()
+        self._clicks: "queue.Queue[tuple[int, float]]" = queue.Queue()
         self._launch_lock = threading.Lock()
         self._last_trigger = 0.0
         self._last_deck: Optional[str] = None
         self._session: Optional[StudySession] = None
         self._hooks = InputHooks(
-            self._enter_presses.put, self._clicks.put, lambda message: self.on_event("error", message)
+            lambda window: self._enter_presses.put((window, time.monotonic())),
+            lambda window: self._clicks.put((window, time.monotonic())),
+            lambda message: self.on_event("error", message),
         )
 
     def start(self) -> None:
@@ -1421,32 +1429,39 @@ class Monitor:
         detector = AIWindowDetector()
         own_pid = os.getpid()
         next_generation_scan = 0.0
+        next_idle_check = 0.0
         # A click or IDE Enter that may have sent a prompt; confirmed once the
         # AI's Stop button appears shortly after.
         pending: tuple[Optional[int], float] = (None, 0.0)
+        # Last background check per AI window: (finished at, AI was working).
+        # Chat UIs show their Stop button almost instantly after a send, faster
+        # than a check takes, so "was the AI already busy?" must be answered by
+        # a check that finished before the press, not one started after it.
+        last_seen: dict[int, tuple[float, bool]] = {}
 
-        def arm(hwnd: int) -> tuple[Optional[int], float]:
-            # If the AI was already answering, this press didn't start it.
-            if self._session is None and not detector.is_generating(hwnd):
-                return hwnd, time.monotonic()
+        def arm(hwnd: int, pressed_at: float) -> tuple[Optional[int], float]:
+            seen_at, was_working = last_seen.get(hwnd, (0.0, False))
+            already_busy = was_working and seen_at <= pressed_at and pressed_at - seen_at < IDLE_CHECK_SECONDS + 1
+            if self._session is None and not already_busy:
+                return hwnd, pressed_at
             return pending
 
         while not self.stop_event.is_set():
             try:
-                hwnd = self._enter_presses.get(timeout=0.25)
+                hwnd, pressed_at = self._enter_presses.get(timeout=0.25)
             except queue.Empty:
                 hwnd = None
             now = time.monotonic()
             if hwnd:
                 _, ai_name = detector.describe(hwnd, self.config)
                 if ai_name and detector.is_ide(hwnd, self.config):
-                    pending = arm(hwnd)  # Enter is also used for coding
+                    pending = arm(hwnd, pressed_at)  # Enter is also used for typing
                 elif ai_name:
                     self._start_session(hwnd, f"prompt sent in {ai_name}", PROMPT_SEND_DELAY_SECONDS)
             while not self._clicks.empty():
-                clicked = self._clicks.get_nowait()
+                clicked, clicked_at = self._clicks.get_nowait()
                 if detector.describe(clicked, self.config)[1]:
-                    pending = arm(clicked)
+                    pending = arm(clicked, clicked_at)
 
             foreground = foreground_window()
             if foreground and window_pid(foreground) != own_pid:
@@ -1454,6 +1469,10 @@ class Monitor:
                 self.current_window = description
                 self.current_is_ai = ai_name is not None
                 armed_here = pending[0] == foreground and now - pending[1] < CLICK_SEND_WINDOW_SECONDS
+                if ai_name and not armed_here and self._session is None and now >= next_idle_check:
+                    next_idle_check = now + IDLE_CHECK_SECONDS
+                    working = detector.is_generating(foreground)
+                    last_seen[foreground] = (time.monotonic(), working)
                 if ai_name and armed_here and self._session is None and now >= next_generation_scan:
                     # The user's click/Enter followed by the AI starting to
                     # answer. The AI resuming on its own between steps is not
