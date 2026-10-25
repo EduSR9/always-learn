@@ -16,7 +16,8 @@ When the AI finishes answering, Anki hides and you're back where you were.**
 
 Works with ChatGPT, Claude, Gemini, Copilot, Perplexity, DeepSeek, Grok and more
 in any major browser or desktop app, and with the AI chat inside **VS Code**
-(Claude Code, Copilot), **Cursor**, **Windsurf**, **Trae** and **Kiro**.
+(Claude Code, Copilot), **Cursor**, **Windsurf**, **Trae**, **Kiro** and
+**Obsidian** (Copilot plugin).
 
 ![Demo: send a prompt, Anki pops up, then hides when the answer is ready](assets/screenshots/demo.gif)
 
@@ -69,9 +70,11 @@ prompt to an AI.
 | | |
 |---|---|
 | **Pause / Resume** | Stops Anki from popping up for a while. |
-| **One deck / Random** | Review one deck, or rotate between several. |
+| **One deck / Random** | Review one deck, or rotate between several. Random skips decks you've finished for today and never repeats a deck twice in a row. |
+| **Presets** | In Random, tick decks (press and drag to tick many at once), type a name like "Chinese" and click **Save preset**. Pick it from the list later to switch. |
 | **Hide Anki when the AI is done** | Hides Anki as soon as the answer is ready. |
-| **Start with Windows / at login** | Starts in the tray at login and opens Anki in the background. |
+| **Play a sound when Anki opens** | A soft chime when your card pops up. Turn it off for silence. |
+| **Start with Windows / at login** | Starts right after you sign in and opens Anki in the background. |
 
 Closing the window keeps Always Learn running in the tray (Windows) or menu
 bar (macOS). Click the robot icon to pause or quit.
@@ -82,7 +85,11 @@ bar (macOS). Click the robot icon to pause or quit.
   should say `✓ AI chat`. If it doesn't, add the site to `ai_sites` in
   `~/.always-learn.json`.
 - **"Open Anki to load your decks":** Anki or AnkiConnect isn't running.
-- **"No card appeared":** the deck has no cards due today.
+- **"No card appeared":** the deck has no cards due today. In Random mode
+  Always Learn skips finished decks by itself.
+- **AI inside an editor (VS Code, Cursor, Obsidian) doesn't trigger it:** the
+  AI's chat panel must be visible, since Always Learn watches for its Stop
+  button to know the answer has started.
 - **Anki doesn't hide after the answer:** keep the AI tab selected in its
   browser window while it answers.
 - **macOS asks for permissions again after an update:** turn Always Learn off
