@@ -455,6 +455,15 @@ def missing_permissions() -> list[str]:
     return []
 
 
+def restore_alt_tab_order(previous: Optional[int], ai_window: int) -> None:
+    """Alt+Tab follows the order windows were last used in, so after Anki was
+    used, Alt+Tab from the AI would land on Anki. Re-using the window from
+    before the AI (e.g. your notes) for a moment puts it back second."""
+    if previous and previous != ai_window and window_exists(previous) and not user32.IsIconic(previous):
+        bring_window_to_front(previous)
+    bring_window_to_front(ai_window)
+
+
 class InputHooks:
     """Reports Enter presses and left clicks (never what is typed)."""
 
@@ -1133,6 +1142,9 @@ if IS_MAC:
             while foreground_window() != handle and time.monotonic() < deadline:
                 time.sleep(0.05)
 
+    def restore_alt_tab_order(previous: Optional[int], ai_window: int) -> None:
+        bring_window_to_front(ai_window)
+
     def minimize_window(handle: int) -> None:
         app = _running_app(handle)
         if app is not None:
@@ -1398,6 +1410,7 @@ class StudySession:
 
     ai_window: int
     started: float
+    previous_window: Optional[int] = None  # what was in front before the AI
     seen_generating: bool = False
     quiet_since: Optional[float] = None
     next_check: float = 0.0
@@ -1417,6 +1430,9 @@ class Monitor:
         self._last_trigger = 0.0
         self._last_deck: Optional[str] = None
         self._session: Optional[StudySession] = None
+        # The front window now and the one before it (ignoring Anki and us).
+        self._window_now: Optional[int] = None
+        self._window_before: Optional[int] = None
         self._hooks = InputHooks(
             lambda window: self._enter_presses.put((window, time.monotonic())),
             lambda window: self._clicks.put((window, time.monotonic())),
@@ -1472,6 +1488,8 @@ class Monitor:
                     pending = arm(clicked, clicked_at)
 
             foreground = foreground_window()
+            if foreground and window_pid(foreground) != own_pid and foreground != self._window_now                     and foreground != find_anki_window():
+                self._window_before, self._window_now = self._window_now, foreground
             if foreground and window_pid(foreground) != own_pid:
                 description, ai_name = detector.describe(foreground, self.config)
                 self.current_window = description
@@ -1495,7 +1513,8 @@ class Monitor:
 
     def _start_session(self, ai_window: int, reason: str, delay: float = 0) -> None:
         if self.trigger(reason, delay):
-            self._session = StudySession(ai_window, time.monotonic())
+            previous = self._window_before if self._window_now == ai_window else self._window_now
+            self._session = StudySession(ai_window, time.monotonic(), previous_window=previous)
 
     def _update_session(self, detector: AIWindowDetector, now: float) -> None:
         session = self._session
@@ -1517,14 +1536,14 @@ class Monitor:
             return
         self._session = None
         if self.config.return_when_done:
-            self._return_to_ai(session.ai_window)
+            self._return_to_ai(session.ai_window, session.previous_window)
 
-    def _return_to_ai(self, ai_window: int) -> None:
+    def _return_to_ai(self, ai_window: int, previous_window: Optional[int] = None) -> None:
         anki_window = find_anki_window()
         if not anki_window or foreground_window() != anki_window:
             return  # the user already moved on; don't yank windows around
         minimize_window(anki_window)
-        bring_window_to_front(ai_window)
+        restore_alt_tab_order(previous_window, ai_window)
         self.on_event("info", f"{time.strftime('%H:%M')}  ·  AI finished, back to the chat")
 
     def trigger(self, reason: str, delay: float = 0) -> bool:
