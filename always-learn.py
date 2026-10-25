@@ -267,6 +267,9 @@ if sys.platform == "win32":
     user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
     user32.BringWindowToTop.argtypes = [wintypes.HWND]
     user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT
+    ]
     user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
     user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
     user32.EnumChildWindows.argtypes = [wintypes.HWND, WNDENUMPROC, wintypes.LPARAM]
@@ -316,6 +319,8 @@ VK_S = 0x53
 KEYEVENTF_KEYUP = 0x0002
 LLKHF_INJECTED = 0x10
 SW_MINIMIZE = 6
+HWND_BOTTOM = 1
+SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
 SW_RESTORE = 9
 WM_GETOBJECT = 0x003D
 OBJID_CLIENT = -4
@@ -440,6 +445,9 @@ def window_exists(handle: int) -> bool:
 
 def minimize_window(handle: int) -> None:
     user32.ShowWindow(handle, SW_MINIMIZE)
+    # Also move it to the bottom of the window order, so Alt+Tab skips it and
+    # goes back to whatever you had open before (e.g. your notes).
+    user32.SetWindowPos(handle, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
 
 
 def missing_permissions() -> list[str]:
