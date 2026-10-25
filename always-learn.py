@@ -212,13 +212,20 @@ def save_config(config: Config) -> None:
     CONFIG_PATH.write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
 
 
-def choose_deck(config: Config, previous: Optional[str] = None) -> str:
+def choose_deck(
+    config: Config, previous: Optional[str] = None, available: Optional[set[str]] = None,
+) -> str:
+    """Pick the deck to study. In random mode only decks in `available` (those
+    with cards due) are used, when known."""
     if config.mode == "random":
         if not config.random_decks:
             raise ValueError("Tick at least one deck for random mode.")
+        pool = [deck for deck in config.random_decks if available is None or deck in available]
+        if not pool:
+            raise ValueError("All your ticked decks are done for today. Nice work!")
         # Never repeat the previous deck, so the decks visibly rotate.
-        others = [deck for deck in config.random_decks if deck != previous]
-        return random.choice(others or config.random_decks)
+        others = [deck for deck in pool if deck != previous]
+        return random.choice(others or pool)
     if not config.configured_deck:
         raise ValueError("Choose an Anki deck first.")
     return config.configured_deck
@@ -640,6 +647,10 @@ class AnkiUnavailable(RuntimeError):
     pass
 
 
+class NoCardsDue(RuntimeError):
+    pass
+
+
 def anki_connect(action: str, timeout: float = 3, **params: object) -> object:
     payload = json.dumps({"action": action, "version": 6, "params": params}).encode("utf-8")
     request = urllib.request.Request(
@@ -829,7 +840,27 @@ def open_anki_deck(deck_name: str, config: Config) -> None:
         time.sleep(0.6)
         if current_review_deck():
             return
-    raise RuntimeError(f"No card appeared. Does {deck_name} have cards due today?")
+    raise NoCardsDue(f"No card appeared. Does {deck_name} have cards due today?")
+
+
+def decks_with_cards_due(decks: list[str]) -> Optional[set[str]]:
+    """The given decks that still have new, learning or review cards today,
+    or None if Anki isn't answering yet."""
+    try:
+        stats = anki_connect("getDeckStats", decks=decks)
+        ids = anki_connect("deckNamesAndIds")
+    except RuntimeError:  # includes AnkiUnavailable
+        return None
+    if not isinstance(stats, dict) or not isinstance(ids, dict):
+        return None
+    # Stats are keyed by deck id; their "name" is only the last part of a
+    # sub-deck's name, so map ids back to full names.
+    due = set()
+    for name in decks:
+        deck = stats.get(str(ids.get(name)))
+        if isinstance(deck, dict) and deck.get("new_count", 0) + deck.get("learn_count", 0) + deck.get("review_count", 0) > 0:
+            due.add(name)
+    return due
 
 
 # --------------------------------------------------------------------------
@@ -1485,10 +1516,22 @@ class Monitor:
                 return  # a launch is already in progress
             try:
                 time.sleep(delay)
-                deck = choose_deck(self.config, self._last_deck)
-                self._last_deck = deck
-                self.on_event("busy", f"Opening {deck}…")
-                open_anki_deck(deck, self.config)
+                empty: set[str] = set()  # decks found to have nothing left today
+                while True:
+                    available = None
+                    if self.config.mode == "random":
+                        due = decks_with_cards_due(self.config.random_decks)
+                        available = (set(self.config.random_decks) if due is None else due) - empty
+                    deck = choose_deck(self.config, self._last_deck, available)
+                    self._last_deck = deck
+                    self.on_event("busy", f"Opening {deck}…")
+                    try:
+                        open_anki_deck(deck, self.config)
+                        break
+                    except NoCardsDue:
+                        if self.config.mode != "random":
+                            raise
+                        empty.add(deck)  # finished for today: try another ticked deck
                 self.on_event("ok", f"{time.strftime('%H:%M')}  ·  {deck}")
             except (ValueError, RuntimeError) as exc:
                 self.on_event("error", str(exc))
